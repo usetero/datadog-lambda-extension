@@ -290,14 +290,8 @@ jobs:
             aws lambda add-layer-version-permission \
               --layer-name "$LAYER_NAME" \
               --version-number "$PUBLISHED_VERSION" \
-              --statement-id public-get-layer-version \
+              --statement-id public-access \
               --action lambda:GetLayerVersion \
-              --principal "*"
-            aws lambda add-layer-version-permission \
-              --layer-name "$LAYER_NAME" \
-              --version-number "$PUBLISHED_VERSION" \
-              --statement-id public-list-layer-versions \
-              --action lambda:ListLayerVersions \
               --principal "*"
             echo "Made version $PUBLISHED_VERSION public"
 
