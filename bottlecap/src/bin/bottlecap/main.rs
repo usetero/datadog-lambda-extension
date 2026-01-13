@@ -508,6 +508,16 @@ async fn extension_loop_active(
     api_key_factory: Arc<ApiKeyFactory>,
     start_time: Instant,
 ) -> anyhow::Result<()> {
+    // Helper to create a string KeyValue for policy metadata
+    fn policy_kv(key: &str, value: &str) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(value.to_string())),
+            }),
+        }
+    }
+
     let (mut event_bus, event_bus_tx) = EventBus::run();
 
     let account_id = r
@@ -525,16 +535,6 @@ async fn extension_loop_active(
         let function_arn =
             build_lambda_function_arn(&account_id, &aws_config.region, &aws_config.function_name);
 
-        // Helper to create a string KeyValue
-        fn kv(key: &str, value: &str) -> KeyValue {
-            KeyValue {
-                key: key.to_string(),
-                value: Some(AnyValue {
-                    value: Some(any_value::Value::StringValue(value.to_string())),
-                }),
-            }
-        }
-
         // Build client metadata from config and AWS context
         // Required resource_attributes: service.instance.id, service.name, service.namespace, service.version
         let service_name = config
@@ -548,21 +548,21 @@ async fn extension_loop_active(
             labels: vec![],
             resource_attributes: vec![
                 // Required fields per proto spec
-                kv("service.instance.id", &function_arn),
-                kv("service.name", service_name),
-                kv("service.namespace", service_namespace),
-                kv(
+                policy_kv("service.instance.id", &function_arn),
+                policy_kv("service.name", service_name),
+                policy_kv("service.namespace", service_namespace),
+                policy_kv(
                     "service.version",
                     config.version.as_deref().unwrap_or("unknown"),
                 ),
                 // Additional context
-                kv("cloud.provider", "aws"),
-                kv("cloud.platform", "aws_lambda"),
-                kv("cloud.region", &aws_config.region),
-                kv("cloud.account.id", &account_id),
-                kv("faas.name", &aws_config.function_name),
-                kv("faas.id", &function_arn),
-                kv(
+                policy_kv("cloud.provider", "aws"),
+                policy_kv("cloud.platform", "aws_lambda"),
+                policy_kv("cloud.region", &aws_config.region),
+                policy_kv("cloud.account.id", &account_id),
+                policy_kv("faas.name", &aws_config.function_name),
+                policy_kv("faas.id", &function_arn),
+                policy_kv(
                     "deployment.environment",
                     config.env.as_deref().unwrap_or("unknown"),
                 ),
@@ -602,14 +602,11 @@ async fn extension_loop_active(
                         }
                     }
                     bottlecap::config::policy_provider::PolicyProviderConfig::File { id, path } => {
-                        match policy_rs::FileProvider::new(path) {
-                            provider => {
-                                if let Err(e) = registry.subscribe(&provider) {
-                                    error!("POLICY | Failed to subscribe provider {}: {}", id, e);
-                                } else {
-                                    debug!("POLICY | Registered File provider: {}", id);
-                                }
-                            }
+                        let provider = policy_rs::FileProvider::new(path);
+                        if let Err(e) = registry.subscribe(&provider) {
+                            error!("POLICY | Failed to subscribe provider {}: {}", id, e);
+                        } else {
+                            debug!("POLICY | Registered File provider: {}", id);
                         }
                     }
                 }

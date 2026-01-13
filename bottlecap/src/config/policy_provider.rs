@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn test_deserialize_file_provider() {
         let json = r#"{"id": "local", "type": "file", "path": "policies.json"}"#;
-        let provider: PolicyProviderConfig = serde_json::from_str(json).unwrap();
+        let provider: PolicyProviderConfig = serde_json::from_str(json).expect("valid JSON");
 
         assert_eq!(
             provider,
@@ -158,7 +158,7 @@ mod tests {
             "headers": [{"name": "Authorization", "value": "Bearer token"}],
             "poll_interval_secs": 30
         }"#;
-        let provider: PolicyProviderConfig = serde_json::from_str(json).unwrap();
+        let provider: PolicyProviderConfig = serde_json::from_str(json).expect("valid JSON");
 
         assert_eq!(
             provider,
@@ -181,7 +181,7 @@ mod tests {
             "type": "http",
             "url": "https://api.example.com/policies"
         }"#;
-        let provider: PolicyProviderConfig = serde_json::from_str(json).unwrap();
+        let provider: PolicyProviderConfig = serde_json::from_str(json).expect("valid JSON");
 
         assert_eq!(
             provider,
@@ -200,7 +200,7 @@ mod tests {
             {"id": "local", "type": "file", "path": "policies.json"},
             {"id": "remote", "type": "http", "url": "https://api.example.com/policies"}
         ]"#;
-        let providers: Vec<PolicyProviderConfig> = serde_json::from_str(json).unwrap();
+        let providers: Vec<PolicyProviderConfig> = serde_json::from_str(json).expect("valid JSON");
 
         assert_eq!(providers.len(), 2);
         assert!(matches!(providers[0], PolicyProviderConfig::File { .. }));
