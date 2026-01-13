@@ -75,7 +75,7 @@ jobs:
           ARCHS="${{ inputs.architectures || 'amd64,arm64' }}"
           REGIONS="${{ inputs.regions || 'us-east-1' }}"
 
-          # Build matrix for build job
+          # Build matrix for build job with platform-specific runners
           BUILD_MATRIX='{"include":['
           FIRST=true
 
@@ -85,7 +85,11 @@ jobs:
             else
               BUILD_MATRIX="$BUILD_MATRIX,"
             fi
-            BUILD_MATRIX="$BUILD_MATRIX{\"arch\":\"$arch\"}"
+            if [ "$arch" = "amd64" ]; then
+              BUILD_MATRIX="$BUILD_MATRIX{\"arch\":\"amd64\",\"runner\":\"ubuntu-24.04\",\"platform\":\"x86_64\"}"
+            else
+              BUILD_MATRIX="$BUILD_MATRIX{\"arch\":\"arm64\",\"runner\":\"ubuntu-24.04-arm\",\"platform\":\"aarch64\"}"
+            fi
           done
 
           BUILD_MATRIX="$BUILD_MATRIX]}"
@@ -114,8 +118,9 @@ jobs:
 
   build:
     name: Build ${{ matrix.arch }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
     needs: prepare
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare.outputs.build_matrix) }}
@@ -125,55 +130,40 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      - name: Set build variables
-        id: vars
-        run: |
-          if [ "${{ matrix.arch }}" == "amd64" ]; then
-            echo "platform=x86_64" >> $GITHUB_OUTPUT
-          else
-            echo "platform=aarch64" >> $GITHUB_OUTPUT
-          fi
-          echo "suffix=${{ matrix.arch }}" >> $GITHUB_OUTPUT
-
       - name: Build Bottlecap binary
         run: |
-          docker buildx build --platform linux/${{ matrix.arch }} \
+          docker buildx build \
             --progress plain \
             --no-cache \
             -t datadog/compile-bottlecap \
             -f ./images/Dockerfile.bottlecap.compile \
-            --build-arg PLATFORM=${{ steps.vars.outputs.platform }} \
+            --build-arg PLATFORM=${{ matrix.platform }} \
             --build-arg FIPS=0 \
             --build-arg DEBUG=0 \
-            --output type=local,dest=.binaries/compiled-bottlecap-${{ steps.vars.outputs.suffix }} \
+            --output type=local,dest=.binaries/compiled-bottlecap-${{ matrix.arch }} \
             .
 
           mkdir -p .binaries
-          cp .binaries/compiled-bottlecap-${{ steps.vars.outputs.suffix }}/bottlecap .binaries/bottlecap-${{ steps.vars.outputs.suffix }}
+          cp .binaries/compiled-bottlecap-${{ matrix.arch }}/bottlecap .binaries/bottlecap-${{ matrix.arch }}
 
       - name: Create Lambda layer zip
         run: |
-          mkdir -p .layers/datadog_extension-${{ steps.vars.outputs.suffix }}
+          mkdir -p .layers/datadog_extension-${{ matrix.arch }}
 
           # Create extensions directory structure
-          mkdir -p .layers/datadog_extension-${{ steps.vars.outputs.suffix }}/extensions
+          mkdir -p .layers/datadog_extension-${{ matrix.arch }}/extensions
 
           # Copy binary
-          cp .binaries/bottlecap-${{ steps.vars.outputs.suffix }} .layers/datadog_extension-${{ steps.vars.outputs.suffix }}/extensions/datadog-agent
-          chmod +x .layers/datadog_extension-${{ steps.vars.outputs.suffix }}/extensions/datadog-agent
+          cp .binaries/bottlecap-${{ matrix.arch }} .layers/datadog_extension-${{ matrix.arch }}/extensions/datadog-agent
+          chmod +x .layers/datadog_extension-${{ matrix.arch }}/extensions/datadog-agent
 
           # Copy wrapper script
-          cp ./scripts/datadog_wrapper .layers/datadog_extension-${{ steps.vars.outputs.suffix }}/datadog_wrapper
-          chmod +x .layers/datadog_extension-${{ steps.vars.outputs.suffix }}/datadog_wrapper
+          cp ./scripts/datadog_wrapper .layers/datadog_extension-${{ matrix.arch }}/datadog_wrapper
+          chmod +x .layers/datadog_extension-${{ matrix.arch }}/datadog_wrapper
 
           # Create zip
-          cd .layers/datadog_extension-${{ steps.vars.outputs.suffix }}
-          zip -r ../datadog_extension-${{ steps.vars.outputs.suffix }}.zip extensions datadog_wrapper
+          cd .layers/datadog_extension-${{ matrix.arch }}
+          zip -r ../datadog_extension-${{ matrix.arch }}.zip extensions datadog_wrapper
           cd ../..
 
           # Show size
@@ -183,8 +173,8 @@ jobs:
       - name: Upload layer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: datadog_extension-${{ steps.vars.outputs.suffix }}
-          path: .layers/datadog_extension-${{ steps.vars.outputs.suffix }}.zip
+          name: datadog_extension-${{ matrix.arch }}
+          path: .layers/datadog_extension-${{ matrix.arch }}.zip
           retention-days: 30
 
   publish:
@@ -219,14 +209,13 @@ jobs:
           # Layer name: Datadog-Extension[-ARM]-Tero
           LAYER_NAME="Datadog-Extension${ARCH_SUFFIX}-Tero"
 
-          echo "suffix=${{ matrix.arch }}" >> $GITHUB_OUTPUT
           echo "layer_name=$LAYER_NAME" >> $GITHUB_OUTPUT
           echo "compatible_arch=$COMPATIBLE_ARCH" >> $GITHUB_OUTPUT
 
       - name: Download layer artifact
         uses: actions/download-artifact@v4
         with:
-          name: datadog_extension-${{ steps.vars.outputs.suffix }}
+          name: datadog_extension-${{ matrix.arch }}
           path: .layers
 
       - name: Determine version
@@ -253,7 +242,7 @@ jobs:
           aws sts get-caller-identity
           LAYER_NAME="${{ steps.vars.outputs.layer_name }}"
           VERSION="${{ steps.version.outputs.version }}"
-          LAYER_FILE=".layers/datadog_extension-${{ steps.vars.outputs.suffix }}.zip"
+          LAYER_FILE=".layers/datadog_extension-${{ matrix.arch }}.zip"
           COMPATIBLE_ARCH="${{ steps.vars.outputs.compatible_arch }}"
 
           echo "Publishing $LAYER_NAME version $VERSION to ${{ matrix.region }}..."
