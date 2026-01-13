@@ -47,8 +47,7 @@ impl PolicyEvaluator {
 
         match self.engine.evaluate(&snapshot, item).await {
             Ok(result) => match result {
-                EvaluateResult::NoMatch => true,
-                EvaluateResult::Keep { .. } => true,
+                EvaluateResult::NoMatch | EvaluateResult::Keep { .. } => true,
                 EvaluateResult::Drop { .. } => {
                     debug!("POLICY | Dropping item due to policy");
                     false
@@ -88,8 +87,7 @@ impl PolicyEvaluator {
 
         match futures::executor::block_on(self.engine.evaluate(&snapshot, item)) {
             Ok(result) => match result {
-                EvaluateResult::NoMatch => true,
-                EvaluateResult::Keep { .. } => true,
+                EvaluateResult::NoMatch | EvaluateResult::Keep { .. } => true,
                 EvaluateResult::Drop { .. } => {
                     debug!("POLICY | Dropping item due to policy");
                     false
@@ -133,7 +131,7 @@ mod tests {
         LogField, LogMatcher, LogTarget, Policy as ProtoPolicy, log_matcher,
     };
 
-    /// Helper to create a test IntakeLog with customizable fields
+    /// Helper to create a test `IntakeLog` with customizable fields
     fn create_test_log(
         message: &str,
         status: &str,
@@ -149,7 +147,7 @@ mod tests {
                     arn: arn.to_string(),
                     request_id: request_id.map(String::from),
                 },
-                timestamp: 1234567890,
+                timestamp: 1_234_567_890,
                 status: status.to_string(),
             },
             hostname: hostname.to_string(),
@@ -728,7 +726,7 @@ mod tests {
 
         for i in 0..total {
             let log = create_test_log(
-                &format!("Log message {}", i),
+                &format!("Log message {i}"),
                 "info",
                 "svc",
                 "host",
@@ -741,11 +739,10 @@ mod tests {
         }
 
         // Should be roughly 50% (with some variance)
-        let ratio = kept as f64 / total as f64;
+        let ratio = f64::from(kept) / f64::from(total);
         assert!(
             ratio > 0.4 && ratio < 0.6,
-            "Sampling ratio {} is outside expected range 0.4-0.6",
-            ratio
+            "Sampling ratio {ratio} is outside expected range 0.4-0.6"
         );
     }
 
@@ -765,11 +762,10 @@ mod tests {
 
         // First 5 should be allowed
         for i in 0..5 {
-            let log = create_test_log(&format!("Log {}", i), "info", "svc", "host", "arn", None);
+            let log = create_test_log(&format!("Log {i}"), "info", "svc", "host", "arn", None);
             assert!(
                 evaluator.should_keep(&log).await,
-                "Log {} should have been kept",
-                i
+                "Log {i} should have been kept"
             );
         }
 
@@ -885,7 +881,7 @@ mod tests {
 
         // Create a very long message
         let long_content = "x".repeat(10000);
-        let long_message = format!("start{}end", long_content);
+        let long_message = format!("start{long_content}end");
         let long_log = create_test_log(&long_message, "info", "svc", "host", "arn", None);
         assert!(!evaluator.should_keep(&long_log).await);
     }

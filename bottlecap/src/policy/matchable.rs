@@ -30,8 +30,7 @@ impl Matchable for IntakeLog {
             // tags are stored as a comma-separated string and we cannot return
             // a &str reference to a parsed value. Policies should use
             // ResourceAttribute for known fields instead.
-            LogFieldSelector::LogAttribute(_) => None,
-            LogFieldSelector::ScopeAttribute(_) => None,
+            LogFieldSelector::LogAttribute(_) | LogFieldSelector::ScopeAttribute(_) => None,
         }
     }
 }
@@ -77,7 +76,7 @@ mod tests {
                     arn: "arn:aws:lambda:us-east-1:123456789:function:test".to_string(),
                     request_id: Some("req-123".to_string()),
                 },
-                timestamp: 1234567890,
+                timestamp: 1_234_567_890,
                 status: "info".to_string(),
             },
             hostname: "test-host".to_string(),

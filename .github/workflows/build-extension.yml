@@ -20,13 +20,12 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.arch }}${{ matrix.fips == '1' && '-fips' || '' }}
+    name: Build ${{ matrix.arch }}
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         arch: [amd64, arm64]
-        fips: ["0", "1"]
     steps:
       - uses: actions/checkout@v4
 
@@ -47,11 +46,7 @@ jobs:
             echo "platform=aarch64" >> $GITHUB_OUTPUT
           fi
 
-          SUFFIX="${{ matrix.arch }}"
-          if [ "${{ matrix.fips }}" == "1" ]; then
-            SUFFIX="${SUFFIX}-fips"
-          fi
-          echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
+          echo "suffix=${{ matrix.arch }}" >> $GITHUB_OUTPUT
 
           if [ "${{ inputs.debug }}" == "true" ]; then
             echo "debug=1" >> $GITHUB_OUTPUT
@@ -67,7 +62,7 @@ jobs:
             -t datadog/compile-bottlecap \
             -f ./images/Dockerfile.bottlecap.compile \
             --build-arg PLATFORM=${{ steps.vars.outputs.platform }} \
-            --build-arg FIPS=${{ matrix.fips }} \
+            --build-arg FIPS=0 \
             --build-arg DEBUG=${{ steps.vars.outputs.debug }} \
             --output type=local,dest=.binaries/compiled-bottlecap-${{ steps.vars.outputs.suffix }} \
             .
