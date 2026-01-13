@@ -43,6 +43,8 @@ start:
 	-e DD_LOG_LEVEL="debug" \
   	-e DD_ENV="dev" \
   	-e DD_DEBUG_WAIT_FOR_ATTACH="$(DEBUG_WAIT)" \
+  	-e DD_POLICY_ENABLED="$(DD_POLICY_ENABLED)" \
+  	-e DD_POLICY_PROVIDERS='$(DD_POLICY_PROVIDERS)' \
   	--volume "$$(pwd)/entrypoint.sh:/entrypoint.sh" \
   	$(IMAGE)
 	@echo "Container '$(CONTAINER_NAME)' started. Use 'make logs' to view logs."

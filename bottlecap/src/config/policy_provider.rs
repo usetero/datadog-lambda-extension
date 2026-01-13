@@ -66,7 +66,7 @@ impl PolicyProviderConfig {
                     })
                     .collect(),
                 poll_interval_secs: Some(*poll_interval_secs),
-                content_type: None,
+                content_type: Some("json".to_string()),
             }),
         }
     }
