@@ -1,4 +1,4 @@
-FROM registry.ddbuild.io/images/mirror/ubuntu:22.04 AS compresser
+FROM ubuntu:22.04 AS compresser
 ARG DATADOG_WRAPPER=datadog_wrapper
 ARG FILE_SUFFIX
 
@@ -35,4 +35,3 @@ RUN  zip -r datadog_extension.zip /extensions /$DATADOG_WRAPPER
 FROM scratch
 COPY --from=compresser /extensions/datadog_extension.zip /
 ENTRYPOINT ["/datadog_extension.zip"]
-

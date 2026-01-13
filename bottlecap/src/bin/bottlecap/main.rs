@@ -95,7 +95,11 @@ use dogstatsd::{
 };
 use libdd_trace_obfuscation::obfuscation_config;
 use libdd_trace_utils::send_data::SendData;
-use policy_rs::{PolicyRegistry, config::register_providers};
+use policy_rs::{
+    ContentType, HttpProvider, HttpProviderConfig, PolicyRegistry,
+    otel_common::{AnyValue, KeyValue, any_value},
+    proto::tero::policy::v1::ClientMetadata,
+};
 use reqwest::Client;
 use std::{collections::hash_map, env, path::Path, str::FromStr, sync::Arc};
 use tokio::time::{Duration, Instant};
@@ -517,15 +521,100 @@ async fn extension_loop_active(
     let policy_evaluator: Option<Arc<PolicyEvaluator>> = if config.policy_enabled {
         let registry = Arc::new(PolicyRegistry::new());
 
+        // Build function ARN for resource attributes
+        let function_arn =
+            build_lambda_function_arn(&account_id, &aws_config.region, &aws_config.function_name);
+
+        // Helper to create a string KeyValue
+        fn kv(key: &str, value: &str) -> KeyValue {
+            KeyValue {
+                key: key.to_string(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::StringValue(value.to_string())),
+                }),
+            }
+        }
+
+        // Build client metadata from config and AWS context
+        // Required resource_attributes: service.instance.id, service.name, service.namespace, service.version
+        let service_name = config
+            .service
+            .as_deref()
+            .unwrap_or(&aws_config.function_name);
+        let service_namespace = config.env.as_deref().unwrap_or("default");
+
+        let client_metadata = ClientMetadata {
+            supported_policy_stages: vec![],
+            labels: vec![],
+            resource_attributes: vec![
+                // Required fields per proto spec
+                kv("service.instance.id", &function_arn),
+                kv("service.name", service_name),
+                kv("service.namespace", service_namespace),
+                kv(
+                    "service.version",
+                    config.version.as_deref().unwrap_or("unknown"),
+                ),
+                // Additional context
+                kv("cloud.provider", "aws"),
+                kv("cloud.platform", "aws_lambda"),
+                kv("cloud.region", &aws_config.region),
+                kv("cloud.account.id", &account_id),
+                kv("faas.name", &aws_config.function_name),
+                kv("faas.id", &function_arn),
+                kv(
+                    "deployment.environment",
+                    config.env.as_deref().unwrap_or("unknown"),
+                ),
+            ],
+        };
+
         // Register all configured providers
         if let Some(providers) = &config.policy_providers {
-            let policy_rs_configs: Vec<_> =
-                providers.iter().map(|p| p.to_policy_rs_config()).collect();
-            if let Err(e) = register_providers(&policy_rs_configs, &registry) {
-                error!("POLICY | Failed to register policy providers: {}", e);
-            } else {
-                debug!("POLICY | Registered {} policy providers", providers.len());
+            for provider_config in providers {
+                match provider_config {
+                    bottlecap::config::policy_provider::PolicyProviderConfig::Http {
+                        id,
+                        url,
+                        headers,
+                        poll_interval_secs,
+                    } => {
+                        let mut http_config = HttpProviderConfig::new(url)
+                            .poll_interval(Duration::from_secs(*poll_interval_secs))
+                            .content_type(ContentType::Json)
+                            .client_metadata(client_metadata.clone());
+
+                        for header in headers {
+                            http_config = http_config.header(&header.name, &header.value);
+                        }
+
+                        match HttpProvider::new_with_initial_fetch(http_config).await {
+                            Ok(provider) => {
+                                if let Err(e) = registry.subscribe(&provider) {
+                                    error!("POLICY | Failed to subscribe provider {}: {}", id, e);
+                                } else {
+                                    debug!("POLICY | Registered HTTP provider: {}", id);
+                                }
+                            }
+                            Err(e) => {
+                                error!("POLICY | Failed to create HTTP provider {}: {}", id, e);
+                            }
+                        }
+                    }
+                    bottlecap::config::policy_provider::PolicyProviderConfig::File { id, path } => {
+                        match policy_rs::FileProvider::new(path) {
+                            provider => {
+                                if let Err(e) = registry.subscribe(&provider) {
+                                    error!("POLICY | Failed to subscribe provider {}: {}", id, e);
+                                } else {
+                                    debug!("POLICY | Registered File provider: {}", id);
+                                }
+                            }
+                        }
+                    }
+                }
             }
+            debug!("POLICY | Registered {} policy providers", providers.len());
         }
 
         Some(Arc::new(PolicyEvaluator::new(registry)))
