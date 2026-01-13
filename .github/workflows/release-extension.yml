@@ -206,8 +206,15 @@ jobs:
             COMPATIBLE_ARCH="arm64"
           fi
 
-          # Layer name: Tero-Datadog-Extension[-ARM]
-          LAYER_NAME="Tero-Datadog-Extension${ARCH_SUFFIX}"
+          # Add -dev suffix for workflow_dispatch (manual) runs
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            DEV_SUFFIX="-dev"
+          else
+            DEV_SUFFIX=""
+          fi
+
+          # Layer name: Tero-Datadog-Extension[-ARM][-dev]
+          LAYER_NAME="Tero-Datadog-Extension${ARCH_SUFFIX}${DEV_SUFFIX}"
 
           echo "layer_name=$LAYER_NAME" >> $GITHUB_OUTPUT
           echo "compatible_arch=$COMPATIBLE_ARCH" >> $GITHUB_OUTPUT
