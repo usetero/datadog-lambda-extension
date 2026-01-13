@@ -271,8 +271,9 @@ jobs:
           while [ "$LATEST" -lt "$VERSION" ]; do
             PUBLISHED_VERSION=$(aws lambda publish-layer-version \
               --layer-name "$LAYER_NAME" \
-              --description "Datadog Lambda Extension (fork)" \
+              --description "Tero Datadog Lambda Extension" \
               --compatible-architectures "$COMPATIBLE_ARCH" \
+              --compatible-runtimes python3.13 python3.14 \
               --zip-file "fileb://${LAYER_FILE}" \
               --query 'Version' \
               --output text)
