@@ -228,8 +228,12 @@ jobs:
             # Get latest version and increment
             LATEST=$(aws lambda list-layer-versions \
               --layer-name "$LAYER_NAME" \
-              --query 'LayerVersions[0].Version || `0`' \
-              --output text 2>/dev/null || echo "0")
+              --query 'LayerVersions[0].Version' \
+              --output text 2>/dev/null | head -1 || echo "0")
+            # Handle empty/None result
+            if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
+              LATEST=0
+            fi
             VERSION=$((LATEST + 1))
             echo "Auto-incremented version to $VERSION (latest was $LATEST)"
           fi
@@ -250,8 +254,12 @@ jobs:
           # Check if version already exists
           LATEST=$(aws lambda list-layer-versions \
             --layer-name "$LAYER_NAME" \
-            --query 'LayerVersions[0].Version || `0`' \
-            --output text 2>/dev/null || echo "0")
+            --query 'LayerVersions[0].Version' \
+            --output text 2>/dev/null | head -1 || echo "0")
+          # Handle empty/None result
+          if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
+            LATEST=0
+          fi
 
           if [ "$LATEST" -ge "$VERSION" ]; then
             echo "::warning::Layer $LAYER_NAME version $VERSION already exists (latest: $LATEST), skipping"
