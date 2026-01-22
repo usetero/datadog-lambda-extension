@@ -29,8 +29,9 @@ Mappings:
     InstrumenterFunctionName:
       Name: tero-remote-instrumenter
     DdRemoteInstrumentLayerVersion:
-      # eslint-disable-next-line
-      Version: { CURRENT_LAYER_VERSION }
+      # Find latest version at: https://github.com/DataDog/serverless-remote-instrumentation/releases
+      # Or in the template: https://datadog-cloudformation-template.s3.amazonaws.com/aws/remote-instrument/latest.yaml
+      Version: 17
     DdCIBypassSiteValidation:
       Bypass: false
     TeroExtensionLayerAwsAccount:
@@ -62,6 +63,7 @@ Conditions:
     !Equals [!Ref EnableCodeSigningConfigurations, "true"]
   HasBucketName: !Not [!Equals [!Ref BucketName, ""]]
   CreateCloudTrail: !Not [!Equals [!Ref UseExistingCloudTrailTrail, "true"]]
+  UseTeroDevLayer: !Equals [!Ref UseTeroDevExtension, "true"]
 
 Parameters:
   EnableCodeSigningConfigurations:
@@ -121,6 +123,14 @@ Parameters:
       Can be found in your Tero dashboard.
     AllowedPattern: ".+"
     NoEcho: true
+  UseTeroDevExtension:
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+    Description: >-
+      Use the dev version of the Tero extension layer (Tero-Datadog-Extension-ARM-dev).
 
 Resources:
   CloudFormationLifeCycle:
@@ -148,12 +158,20 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Handler: /opt/nodejs/node_modules/datadog-remote-instrument/handler.handler
       Layers:
-        - !Sub
-          - "arn:aws:lambda:${AWS::Region}:${AccountNumber}:layer:Tero-Datadog-Extension-ARM:${LayerVersion}"
-          - AccountNumber:
-              !FindInMap [Constants, TeroExtensionLayerAwsAccount, Number]
-            LayerVersion:
-              !FindInMap [Constants, TeroExtensionLayerVersion, Version]
+        - !If
+          - UseTeroDevLayer
+          - !Sub
+            - "arn:aws:lambda:${AWS::Region}:${AccountNumber}:layer:Tero-Datadog-Extension-ARM-dev:${LayerVersion}"
+            - AccountNumber:
+                !FindInMap [Constants, TeroExtensionLayerAwsAccount, Number]
+              LayerVersion:
+                !FindInMap [Constants, TeroExtensionLayerVersion, Version]
+          - !Sub
+            - "arn:aws:lambda:${AWS::Region}:${AccountNumber}:layer:Tero-Datadog-Extension-ARM:${LayerVersion}"
+            - AccountNumber:
+                !FindInMap [Constants, TeroExtensionLayerAwsAccount, Number]
+              LayerVersion:
+                !FindInMap [Constants, TeroExtensionLayerVersion, Version]
         - !Join
           - ""
           - - "arn:aws:lambda:"
