@@ -105,7 +105,7 @@ use std::{collections::hash_map, env, path::Path, str::FromStr, sync::Arc};
 use tokio::time::{Duration, Instant};
 use tokio::{sync::Mutex as TokioMutex, sync::mpsc::Sender, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use ustr::Ustr;
 
@@ -605,11 +605,17 @@ async fn extension_loop_active(
                                 if let Err(e) = registry.subscribe(&provider) {
                                     error!("POLICY | Failed to subscribe provider {}: {}", id, e);
                                 } else {
-                                    debug!("POLICY | Registered HTTP provider: {}", id);
+                                    info!(
+                                        "POLICY | Successfully synced with Tero control plane (provider: {}, url: {})",
+                                        id, url
+                                    );
                                 }
                             }
                             Err(e) => {
-                                error!("POLICY | Failed to create HTTP provider {}: {}", id, e);
+                                error!(
+                                    "POLICY | Failed to sync with Tero control plane (provider: {}): {}",
+                                    id, e
+                                );
                             }
                         }
                     }
@@ -618,12 +624,15 @@ async fn extension_loop_active(
                         if let Err(e) = registry.subscribe(&provider) {
                             error!("POLICY | Failed to subscribe provider {}: {}", id, e);
                         } else {
-                            debug!("POLICY | Registered File provider: {}", id);
+                            info!("POLICY | Registered file provider: {} (path: {})", id, path);
                         }
                     }
                 }
             }
-            debug!("POLICY | Registered {} policy providers", providers.len());
+            info!(
+                "POLICY | Tero policy evaluation enabled with {} provider(s)",
+                providers.len()
+            );
         }
 
         Some(Arc::new(PolicyEvaluator::new(registry)))

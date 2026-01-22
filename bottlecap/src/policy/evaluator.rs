@@ -44,29 +44,41 @@ impl PolicyEvaluator {
     /// - `RateLimit`: Keep based on rate limit decision
     pub async fn should_keep<M: Matchable>(&self, item: &M) -> bool {
         let snapshot = self.registry.snapshot();
+        let policy_count = snapshot.len();
+
+        debug!("POLICY | Evaluating item against {} policies", policy_count);
 
         match self.engine.evaluate(&snapshot, item).await {
-            Ok(result) => match result {
-                EvaluateResult::NoMatch | EvaluateResult::Keep { .. } => true,
-                EvaluateResult::Drop { .. } => {
-                    debug!("POLICY | Dropping item due to policy");
-                    false
-                }
-                EvaluateResult::Sample {
-                    keep, percentage, ..
-                } => {
-                    if !keep {
-                        debug!("POLICY | Dropping item due to sampling ({}%)", percentage);
+            Ok(result) => {
+                debug!("POLICY | Evaluation result: {:?}", result);
+                match result {
+                    EvaluateResult::NoMatch => {
+                        debug!("POLICY | No matching policy, keeping item");
+                        true
                     }
-                    keep
-                }
-                EvaluateResult::RateLimit { allowed, .. } => {
-                    if !allowed {
-                        debug!("POLICY | Dropping item due to rate limit");
+                    EvaluateResult::Keep { .. } => {
+                        debug!("POLICY | Policy matched, keeping item");
+                        true
                     }
-                    allowed
+                    EvaluateResult::Drop { .. } => {
+                        debug!("POLICY | Dropping item due to policy");
+                        false
+                    }
+                    EvaluateResult::Sample {
+                        keep, percentage, ..
+                    } => {
+                        debug!(
+                            "POLICY | Sampling decision: keep={}, percentage={}%",
+                            keep, percentage
+                        );
+                        keep
+                    }
+                    EvaluateResult::RateLimit { allowed, .. } => {
+                        debug!("POLICY | Rate limit decision: allowed={}", allowed);
+                        allowed
+                    }
                 }
-            },
+            }
             Err(e) => {
                 // Fail open: keep the item if evaluation fails
                 warn!("POLICY | Evaluation error, keeping item: {}", e);
@@ -84,29 +96,44 @@ impl PolicyEvaluator {
     #[must_use]
     pub fn should_keep_sync<M: Matchable>(&self, item: &M) -> bool {
         let snapshot = self.registry.snapshot();
+        let policy_count = snapshot.len();
+
+        debug!(
+            "POLICY | Evaluating item (sync) against {} policies",
+            policy_count
+        );
 
         match futures::executor::block_on(self.engine.evaluate(&snapshot, item)) {
-            Ok(result) => match result {
-                EvaluateResult::NoMatch | EvaluateResult::Keep { .. } => true,
-                EvaluateResult::Drop { .. } => {
-                    debug!("POLICY | Dropping item due to policy");
-                    false
-                }
-                EvaluateResult::Sample {
-                    keep, percentage, ..
-                } => {
-                    if !keep {
-                        debug!("POLICY | Dropping item due to sampling ({}%)", percentage);
+            Ok(result) => {
+                debug!("POLICY | Evaluation result: {:?}", result);
+                match result {
+                    EvaluateResult::NoMatch => {
+                        debug!("POLICY | No matching policy, keeping item");
+                        true
                     }
-                    keep
-                }
-                EvaluateResult::RateLimit { allowed, .. } => {
-                    if !allowed {
-                        debug!("POLICY | Dropping item due to rate limit");
+                    EvaluateResult::Keep { .. } => {
+                        debug!("POLICY | Policy matched, keeping item");
+                        true
                     }
-                    allowed
+                    EvaluateResult::Drop { .. } => {
+                        debug!("POLICY | Dropping item due to policy");
+                        false
+                    }
+                    EvaluateResult::Sample {
+                        keep, percentage, ..
+                    } => {
+                        debug!(
+                            "POLICY | Sampling decision: keep={}, percentage={}%",
+                            keep, percentage
+                        );
+                        keep
+                    }
+                    EvaluateResult::RateLimit { allowed, .. } => {
+                        debug!("POLICY | Rate limit decision: allowed={}", allowed);
+                        allowed
+                    }
                 }
-            },
+            }
             Err(e) => {
                 // Fail open: keep the item if evaluation fails
                 warn!("POLICY | Evaluation error, keeping item: {}", e);
