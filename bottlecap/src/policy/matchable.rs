@@ -4,6 +4,8 @@
 //! for `IntakeLog` (logs) and `SpanWrapper` (traces), enabling policy evaluation
 //! against these telemetry types.
 
+use std::borrow::Cow;
+
 use policy_rs::proto::tero::policy::v1::LogField;
 use policy_rs::{LogFieldSelector, Matchable};
 
@@ -11,26 +13,31 @@ use crate::logs::lambda::IntakeLog;
 use libdd_trace_protobuf::pb;
 
 impl Matchable for IntakeLog {
-    fn get_field(&self, field: &LogFieldSelector) -> Option<&str> {
+    fn get_field(&self, field: &LogFieldSelector) -> Option<Cow<'_, str>> {
         match field {
             LogFieldSelector::Simple(simple) => match simple {
-                LogField::Body => Some(&self.message.message),
-                LogField::SeverityText => Some(&self.message.status),
+                LogField::Body => Some(Cow::Borrowed(&self.message.message)),
+                LogField::SeverityText => Some(Cow::Borrowed(&self.message.status)),
                 _ => None,
             },
             LogFieldSelector::ResourceAttribute(key) => match key.as_str() {
-                "service" => Some(&self.service),
-                "host" | "hostname" => Some(&self.hostname),
-                "source" => Some(&self.source),
-                "arn" => Some(&self.message.lambda.arn),
-                "request_id" => self.message.lambda.request_id.as_deref(),
+                "service" => Some(Cow::Borrowed(&self.service)),
+                "host" | "hostname" => Some(Cow::Borrowed(&self.hostname)),
+                "source" => Some(Cow::Borrowed(&self.source)),
+                "arn" => Some(Cow::Borrowed(&self.message.lambda.arn)),
+                "request_id" => self.message.lambda.request_id.as_deref().map(Cow::Borrowed),
                 _ => None,
             },
-            // Note: LogAttribute matching against tags is not supported because
-            // tags are stored as a comma-separated string and we cannot return
-            // a &str reference to a parsed value. Policies should use
-            // ResourceAttribute for known fields instead.
-            LogFieldSelector::LogAttribute(_) | LogFieldSelector::ScopeAttribute(_) => None,
+            // Parse tags on-the-fly: tags are stored as "key1:value1,key2:value2"
+            LogFieldSelector::LogAttribute(key) => self.tags.split(',').find_map(|tag| {
+                let (k, v) = tag.split_once(':')?;
+                if k == key {
+                    Some(Cow::Owned(v.to_string()))
+                } else {
+                    None
+                }
+            }),
+            LogFieldSelector::ScopeAttribute(_) => None,
         }
     }
 }
@@ -43,20 +50,22 @@ impl Matchable for IntakeLog {
 pub struct SpanWrapper<'a>(pub &'a pb::Span);
 
 impl Matchable for SpanWrapper<'_> {
-    fn get_field(&self, field: &LogFieldSelector) -> Option<&str> {
+    fn get_field(&self, field: &LogFieldSelector) -> Option<Cow<'_, str>> {
         match field {
             LogFieldSelector::Simple(simple) => match simple {
-                LogField::Body => Some(&self.0.resource),
+                LogField::Body => Some(Cow::Borrowed(&self.0.resource)),
                 _ => None,
             },
             LogFieldSelector::ResourceAttribute(key) => match key.as_str() {
-                "service" => Some(&self.0.service),
-                "name" => Some(&self.0.name),
-                "resource" => Some(&self.0.resource),
-                "type" => Some(&self.0.r#type),
-                _ => self.0.meta.get(key).map(String::as_str),
+                "service" => Some(Cow::Borrowed(&self.0.service)),
+                "name" => Some(Cow::Borrowed(&self.0.name)),
+                "resource" => Some(Cow::Borrowed(&self.0.resource)),
+                "type" => Some(Cow::Borrowed(&self.0.r#type)),
+                _ => self.0.meta.get(key).map(|s| Cow::Borrowed(s.as_str())),
             },
-            LogFieldSelector::LogAttribute(key) => self.0.meta.get(key).map(String::as_str),
+            LogFieldSelector::LogAttribute(key) => {
+                self.0.meta.get(key).map(|s| Cow::Borrowed(s.as_str()))
+            }
             LogFieldSelector::ScopeAttribute(_) => None,
         }
     }
@@ -105,7 +114,8 @@ mod tests {
     fn test_intake_log_body() {
         let log = create_test_intake_log();
         assert_eq!(
-            log.get_field(&LogFieldSelector::Simple(LogField::Body)),
+            log.get_field(&LogFieldSelector::Simple(LogField::Body))
+                .as_deref(),
             Some("Test log message")
         );
     }
@@ -114,7 +124,8 @@ mod tests {
     fn test_intake_log_severity() {
         let log = create_test_intake_log();
         assert_eq!(
-            log.get_field(&LogFieldSelector::Simple(LogField::SeverityText)),
+            log.get_field(&LogFieldSelector::Simple(LogField::SeverityText))
+                .as_deref(),
             Some("info")
         );
     }
@@ -124,21 +135,25 @@ mod tests {
         let log = create_test_intake_log();
 
         assert_eq!(
-            log.get_field(&LogFieldSelector::ResourceAttribute("service".to_string())),
+            log.get_field(&LogFieldSelector::ResourceAttribute("service".to_string()))
+                .as_deref(),
             Some("test-service")
         );
         assert_eq!(
-            log.get_field(&LogFieldSelector::ResourceAttribute("hostname".to_string())),
+            log.get_field(&LogFieldSelector::ResourceAttribute("hostname".to_string()))
+                .as_deref(),
             Some("test-host")
         );
         assert_eq!(
-            log.get_field(&LogFieldSelector::ResourceAttribute("arn".to_string())),
+            log.get_field(&LogFieldSelector::ResourceAttribute("arn".to_string()))
+                .as_deref(),
             Some("arn:aws:lambda:us-east-1:123456789:function:test")
         );
         assert_eq!(
             log.get_field(&LogFieldSelector::ResourceAttribute(
                 "request_id".to_string()
-            )),
+            ))
+            .as_deref(),
             Some("req-123")
         );
     }
@@ -151,7 +166,34 @@ mod tests {
         assert_eq!(
             log.get_field(&LogFieldSelector::ResourceAttribute(
                 "request_id".to_string()
-            )),
+            ))
+            .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_intake_log_tag_attribute() {
+        let log = create_test_intake_log();
+
+        // Should find "env" tag with value "test"
+        assert_eq!(
+            log.get_field(&LogFieldSelector::LogAttribute("env".to_string()))
+                .as_deref(),
+            Some("test")
+        );
+
+        // Should find "region" tag with value "us-east-1"
+        assert_eq!(
+            log.get_field(&LogFieldSelector::LogAttribute("region".to_string()))
+                .as_deref(),
+            Some("us-east-1")
+        );
+
+        // Should return None for non-existent tag
+        assert_eq!(
+            log.get_field(&LogFieldSelector::LogAttribute("nonexistent".to_string()))
+                .as_deref(),
             None
         );
     }
@@ -161,7 +203,9 @@ mod tests {
         let span = create_test_span();
         let wrapper = SpanWrapper(&span);
         assert_eq!(
-            wrapper.get_field(&LogFieldSelector::Simple(LogField::Body)),
+            wrapper
+                .get_field(&LogFieldSelector::Simple(LogField::Body))
+                .as_deref(),
             Some("/api/users")
         );
     }
@@ -172,15 +216,21 @@ mod tests {
         let wrapper = SpanWrapper(&span);
 
         assert_eq!(
-            wrapper.get_field(&LogFieldSelector::ResourceAttribute("service".to_string())),
+            wrapper
+                .get_field(&LogFieldSelector::ResourceAttribute("service".to_string()))
+                .as_deref(),
             Some("test-service")
         );
         assert_eq!(
-            wrapper.get_field(&LogFieldSelector::ResourceAttribute("name".to_string())),
+            wrapper
+                .get_field(&LogFieldSelector::ResourceAttribute("name".to_string()))
+                .as_deref(),
             Some("test.span")
         );
         assert_eq!(
-            wrapper.get_field(&LogFieldSelector::ResourceAttribute("type".to_string())),
+            wrapper
+                .get_field(&LogFieldSelector::ResourceAttribute("type".to_string()))
+                .as_deref(),
             Some("web")
         );
     }
@@ -191,7 +241,9 @@ mod tests {
         let wrapper = SpanWrapper(&span);
 
         assert_eq!(
-            wrapper.get_field(&LogFieldSelector::ResourceAttribute("env".to_string())),
+            wrapper
+                .get_field(&LogFieldSelector::ResourceAttribute("env".to_string()))
+                .as_deref(),
             Some("production")
         );
     }
@@ -202,11 +254,15 @@ mod tests {
         let wrapper = SpanWrapper(&span);
 
         assert_eq!(
-            wrapper.get_field(&LogFieldSelector::LogAttribute("custom_tag".to_string())),
+            wrapper
+                .get_field(&LogFieldSelector::LogAttribute("custom_tag".to_string()))
+                .as_deref(),
             Some("custom_value")
         );
         assert_eq!(
-            wrapper.get_field(&LogFieldSelector::LogAttribute("nonexistent".to_string())),
+            wrapper
+                .get_field(&LogFieldSelector::LogAttribute("nonexistent".to_string()))
+                .as_deref(),
             None
         );
     }
