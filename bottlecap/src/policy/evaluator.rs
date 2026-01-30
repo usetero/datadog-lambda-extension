@@ -158,7 +158,7 @@ mod tests {
         AttributePath, LogField, LogMatcher, LogTarget, Policy as ProtoPolicy, log_matcher,
     };
 
-    /// Helper to create an AttributePath from a single key string
+    /// Helper to create an `AttributePath` from a single key string
     fn attr_path(key: &str) -> AttributePath {
         AttributePath {
             path: vec![key.to_string()],
@@ -1918,7 +1918,7 @@ mod tests {
         let evaluator = PolicyEvaluator::new(registry);
 
         // Multiple logs from "service-a" should all have the same decision
-        let mut service_a_decisions = Vec::new();
+        let mut decisions_svc_a = Vec::new();
         for i in 0..5 {
             let log = create_test_log(
                 &format!("Log {i}"),
@@ -1928,17 +1928,17 @@ mod tests {
                 "arn",
                 None,
             );
-            service_a_decisions.push(evaluator.should_keep(&log).await);
+            decisions_svc_a.push(evaluator.should_keep(&log).await);
         }
 
-        let first_a = service_a_decisions[0];
+        let first_a = decisions_svc_a[0];
         assert!(
-            service_a_decisions.iter().all(|&d| d == first_a),
+            decisions_svc_a.iter().all(|&d| d == first_a),
             "All logs from service-a should have the same decision"
         );
 
         // Multiple logs from "service-b" should all have the same decision
-        let mut service_b_decisions = Vec::new();
+        let mut decisions_svc_b = Vec::new();
         for i in 0..5 {
             let log = create_test_log(
                 &format!("Log {i}"),
@@ -1948,12 +1948,12 @@ mod tests {
                 "arn",
                 None,
             );
-            service_b_decisions.push(evaluator.should_keep(&log).await);
+            decisions_svc_b.push(evaluator.should_keep(&log).await);
         }
 
-        let first_b = service_b_decisions[0];
+        let first_b = decisions_svc_b[0];
         assert!(
-            service_b_decisions.iter().all(|&d| d == first_b),
+            decisions_svc_b.iter().all(|&d| d == first_b),
             "All logs from service-b should have the same decision"
         );
     }
