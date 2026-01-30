@@ -20,23 +20,30 @@ impl Matchable for IntakeLog {
                 LogField::SeverityText => Some(Cow::Borrowed(&self.message.status)),
                 _ => None,
             },
-            LogFieldSelector::ResourceAttribute(key) => match key.as_str() {
-                "service" => Some(Cow::Borrowed(&self.service)),
-                "host" | "hostname" => Some(Cow::Borrowed(&self.hostname)),
-                "source" => Some(Cow::Borrowed(&self.source)),
-                "arn" => Some(Cow::Borrowed(&self.message.lambda.arn)),
-                "request_id" => self.message.lambda.request_id.as_deref().map(Cow::Borrowed),
-                _ => None,
-            },
-            // Parse tags on-the-fly: tags are stored as "key1:value1,key2:value2"
-            LogFieldSelector::LogAttribute(key) => self.tags.split(',').find_map(|tag| {
-                let (k, v) = tag.split_once(':')?;
-                if k == key {
-                    Some(Cow::Owned(v.to_string()))
-                } else {
-                    None
+            LogFieldSelector::ResourceAttribute(key) => {
+                // key is a Vec<String> representing a path; we match on the first element
+                let first_key = key.first().map(String::as_str)?;
+                match first_key {
+                    "service" => Some(Cow::Borrowed(&self.service)),
+                    "host" | "hostname" => Some(Cow::Borrowed(&self.hostname)),
+                    "source" => Some(Cow::Borrowed(&self.source)),
+                    "arn" => Some(Cow::Borrowed(&self.message.lambda.arn)),
+                    "request_id" => self.message.lambda.request_id.as_deref().map(Cow::Borrowed),
+                    _ => None,
                 }
-            }),
+            }
+            // Parse tags on-the-fly: tags are stored as "key1:value1,key2:value2"
+            LogFieldSelector::LogAttribute(key) => {
+                let first_key = key.first().map(String::as_str)?;
+                self.tags.split(',').find_map(|tag| {
+                    let (k, v) = tag.split_once(':')?;
+                    if k == first_key {
+                        Some(Cow::Owned(v.to_string()))
+                    } else {
+                        None
+                    }
+                })
+            }
             LogFieldSelector::ScopeAttribute(_) => None,
         }
     }
@@ -56,15 +63,27 @@ impl Matchable for SpanWrapper<'_> {
                 LogField::Body => Some(Cow::Borrowed(&self.0.resource)),
                 _ => None,
             },
-            LogFieldSelector::ResourceAttribute(key) => match key.as_str() {
-                "service" => Some(Cow::Borrowed(&self.0.service)),
-                "name" => Some(Cow::Borrowed(&self.0.name)),
-                "resource" => Some(Cow::Borrowed(&self.0.resource)),
-                "type" => Some(Cow::Borrowed(&self.0.r#type)),
-                _ => self.0.meta.get(key).map(|s| Cow::Borrowed(s.as_str())),
-            },
+            LogFieldSelector::ResourceAttribute(key) => {
+                // key is a Vec<String> representing a path; we match on the first element
+                let first_key = key.first().map(String::as_str)?;
+                match first_key {
+                    "service" => Some(Cow::Borrowed(&self.0.service)),
+                    "name" => Some(Cow::Borrowed(&self.0.name)),
+                    "resource" => Some(Cow::Borrowed(&self.0.resource)),
+                    "type" => Some(Cow::Borrowed(&self.0.r#type)),
+                    _ => self
+                        .0
+                        .meta
+                        .get(first_key)
+                        .map(|s| Cow::Borrowed(s.as_str())),
+                }
+            }
             LogFieldSelector::LogAttribute(key) => {
-                self.0.meta.get(key).map(|s| Cow::Borrowed(s.as_str()))
+                let first_key = key.first()?;
+                self.0
+                    .meta
+                    .get(first_key)
+                    .map(|s| Cow::Borrowed(s.as_str()))
             }
             LogFieldSelector::ScopeAttribute(_) => None,
         }
@@ -135,24 +154,30 @@ mod tests {
         let log = create_test_intake_log();
 
         assert_eq!(
-            log.get_field(&LogFieldSelector::ResourceAttribute("service".to_string()))
-                .as_deref(),
+            log.get_field(&LogFieldSelector::ResourceAttribute(vec![
+                "service".to_string()
+            ]))
+            .as_deref(),
             Some("test-service")
         );
         assert_eq!(
-            log.get_field(&LogFieldSelector::ResourceAttribute("hostname".to_string()))
-                .as_deref(),
+            log.get_field(&LogFieldSelector::ResourceAttribute(vec![
+                "hostname".to_string()
+            ]))
+            .as_deref(),
             Some("test-host")
         );
         assert_eq!(
-            log.get_field(&LogFieldSelector::ResourceAttribute("arn".to_string()))
-                .as_deref(),
+            log.get_field(&LogFieldSelector::ResourceAttribute(vec![
+                "arn".to_string()
+            ]))
+            .as_deref(),
             Some("arn:aws:lambda:us-east-1:123456789:function:test")
         );
         assert_eq!(
-            log.get_field(&LogFieldSelector::ResourceAttribute(
+            log.get_field(&LogFieldSelector::ResourceAttribute(vec![
                 "request_id".to_string()
-            ))
+            ]))
             .as_deref(),
             Some("req-123")
         );
@@ -164,9 +189,9 @@ mod tests {
         log.message.lambda.request_id = None;
 
         assert_eq!(
-            log.get_field(&LogFieldSelector::ResourceAttribute(
+            log.get_field(&LogFieldSelector::ResourceAttribute(vec![
                 "request_id".to_string()
-            ))
+            ]))
             .as_deref(),
             None
         );
@@ -178,22 +203,24 @@ mod tests {
 
         // Should find "env" tag with value "test"
         assert_eq!(
-            log.get_field(&LogFieldSelector::LogAttribute("env".to_string()))
+            log.get_field(&LogFieldSelector::LogAttribute(vec!["env".to_string()]))
                 .as_deref(),
             Some("test")
         );
 
         // Should find "region" tag with value "us-east-1"
         assert_eq!(
-            log.get_field(&LogFieldSelector::LogAttribute("region".to_string()))
+            log.get_field(&LogFieldSelector::LogAttribute(vec!["region".to_string()]))
                 .as_deref(),
             Some("us-east-1")
         );
 
         // Should return None for non-existent tag
         assert_eq!(
-            log.get_field(&LogFieldSelector::LogAttribute("nonexistent".to_string()))
-                .as_deref(),
+            log.get_field(&LogFieldSelector::LogAttribute(vec![
+                "nonexistent".to_string()
+            ]))
+            .as_deref(),
             None
         );
     }
@@ -217,19 +244,25 @@ mod tests {
 
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ResourceAttribute("service".to_string()))
+                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                    "service".to_string()
+                ]))
                 .as_deref(),
             Some("test-service")
         );
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ResourceAttribute("name".to_string()))
+                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                    "name".to_string()
+                ]))
                 .as_deref(),
             Some("test.span")
         );
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ResourceAttribute("type".to_string()))
+                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                    "type".to_string()
+                ]))
                 .as_deref(),
             Some("web")
         );
@@ -242,7 +275,9 @@ mod tests {
 
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ResourceAttribute("env".to_string()))
+                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                    "env".to_string()
+                ]))
                 .as_deref(),
             Some("production")
         );
@@ -255,13 +290,17 @@ mod tests {
 
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::LogAttribute("custom_tag".to_string()))
+                .get_field(&LogFieldSelector::LogAttribute(vec![
+                    "custom_tag".to_string()
+                ]))
                 .as_deref(),
             Some("custom_value")
         );
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::LogAttribute("nonexistent".to_string()))
+                .get_field(&LogFieldSelector::LogAttribute(vec![
+                    "nonexistent".to_string()
+                ]))
                 .as_deref(),
             None
         );

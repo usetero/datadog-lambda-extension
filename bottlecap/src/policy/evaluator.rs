@@ -155,8 +155,15 @@ mod tests {
     use crate::logs::lambda::{IntakeLog, Lambda, Message};
     use policy_rs::Policy;
     use policy_rs::proto::tero::policy::v1::{
-        LogField, LogMatcher, LogTarget, Policy as ProtoPolicy, log_matcher,
+        AttributePath, LogField, LogMatcher, LogTarget, Policy as ProtoPolicy, log_matcher,
     };
+
+    /// Helper to create an AttributePath from a single key string
+    fn attr_path(key: &str) -> AttributePath {
+        AttributePath {
+            path: vec![key.to_string()],
+        }
+    }
 
     /// Helper to create a test `IntakeLog` with customizable fields
     fn create_test_log(
@@ -202,12 +209,14 @@ mod tests {
             field: Some(log_matcher::Field::LogField(LogField::Body.into())),
             r#match: Some(log_matcher::Match::Regex(pattern.to_string())),
             negate: false,
+            case_insensitive: false,
         };
 
         let log_target = LogTarget {
             r#match: vec![matcher],
             keep: keep.to_string(),
             transform: None,
+            sample_key: None,
         };
 
         let proto = ProtoPolicy {
@@ -229,12 +238,14 @@ mod tests {
             field: Some(log_matcher::Field::LogField(LogField::Body.into())),
             r#match: Some(log_matcher::Match::Exact(value.to_string())),
             negate: false,
+            case_insensitive: false,
         };
 
         let log_target = LogTarget {
             r#match: vec![matcher],
             keep: keep.to_string(),
             transform: None,
+            sample_key: None,
         };
 
         let proto = ProtoPolicy {
@@ -256,12 +267,14 @@ mod tests {
             field: Some(log_matcher::Field::LogField(LogField::SeverityText.into())),
             r#match: Some(log_matcher::Match::Exact(severity.to_string())),
             negate: false,
+            case_insensitive: false,
         };
 
         let log_target = LogTarget {
             r#match: vec![matcher],
             keep: keep.to_string(),
             transform: None,
+            sample_key: None,
         };
 
         let proto = ProtoPolicy {
@@ -286,15 +299,17 @@ mod tests {
         enabled: bool,
     ) -> Policy {
         let matcher = LogMatcher {
-            field: Some(log_matcher::Field::ResourceAttribute(attr_key.to_string())),
+            field: Some(log_matcher::Field::ResourceAttribute(attr_path(attr_key))),
             r#match: Some(log_matcher::Match::Regex(pattern.to_string())),
             negate: false,
+            case_insensitive: false,
         };
 
         let log_target = LogTarget {
             r#match: vec![matcher],
             keep: keep.to_string(),
             transform: None,
+            sample_key: None,
         };
 
         let proto = ProtoPolicy {
@@ -316,12 +331,14 @@ mod tests {
             field: Some(log_matcher::Field::LogField(LogField::Body.into())),
             r#match: Some(log_matcher::Match::Regex(pattern.to_string())),
             negate: true,
+            case_insensitive: false,
         };
 
         let log_target = LogTarget {
             r#match: vec![matcher],
             keep: keep.to_string(),
             transform: None,
+            sample_key: None,
         };
 
         let proto = ProtoPolicy {
@@ -349,18 +366,21 @@ mod tests {
             field: Some(log_matcher::Field::LogField(LogField::Body.into())),
             r#match: Some(log_matcher::Match::Regex(body_pattern.to_string())),
             negate: false,
+            case_insensitive: false,
         };
 
         let severity_matcher = LogMatcher {
             field: Some(log_matcher::Field::LogField(LogField::SeverityText.into())),
             r#match: Some(log_matcher::Match::Exact(severity.to_string())),
             negate: false,
+            case_insensitive: false,
         };
 
         let log_target = LogTarget {
             r#match: vec![body_matcher, severity_matcher],
             keep: keep.to_string(),
             transform: None,
+            sample_key: None,
         };
 
         let proto = ProtoPolicy {
@@ -1554,6 +1574,388 @@ mod tests {
         // Should NOT match if no value follows
         let log4 = create_test_log("Enter your password", "info", "svc", "host", "arn", None);
         assert!(evaluator.should_keep(&log4).await);
+    }
+
+    // ==================== Case Insensitive Matching Tests ====================
+
+    /// Helper to create a policy with case-insensitive matching
+    fn case_insensitive_body_regex_policy(
+        id: &str,
+        pattern: &str,
+        keep: &str,
+        enabled: bool,
+    ) -> Policy {
+        let matcher = LogMatcher {
+            field: Some(log_matcher::Field::LogField(LogField::Body.into())),
+            r#match: Some(log_matcher::Match::Regex(pattern.to_string())),
+            negate: false,
+            case_insensitive: true,
+        };
+
+        let log_target = LogTarget {
+            r#match: vec![matcher],
+            keep: keep.to_string(),
+            transform: None,
+            sample_key: None,
+        };
+
+        let proto = ProtoPolicy {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled,
+            target: Some(policy_rs::proto::tero::policy::v1::policy::Target::Log(
+                log_target,
+            )),
+            ..Default::default()
+        };
+
+        Policy::new(proto)
+    }
+
+    /// Helper to create a policy with case-insensitive exact matching
+    fn case_insensitive_body_exact_policy(
+        id: &str,
+        value: &str,
+        keep: &str,
+        enabled: bool,
+    ) -> Policy {
+        let matcher = LogMatcher {
+            field: Some(log_matcher::Field::LogField(LogField::Body.into())),
+            r#match: Some(log_matcher::Match::Exact(value.to_string())),
+            negate: false,
+            case_insensitive: true,
+        };
+
+        let log_target = LogTarget {
+            r#match: vec![matcher],
+            keep: keep.to_string(),
+            transform: None,
+            sample_key: None,
+        };
+
+        let proto = ProtoPolicy {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled,
+            target: Some(policy_rs::proto::tero::policy::v1::policy::Target::Log(
+                log_target,
+            )),
+            ..Default::default()
+        };
+
+        Policy::new(proto)
+    }
+
+    #[tokio::test]
+    async fn test_case_insensitive_regex_matching() {
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+
+        // Create policy with case_insensitive: true
+        let policy = case_insensitive_body_regex_policy("drop-error-ci", "error", "none", true);
+        handle.update(vec![policy]);
+
+        let evaluator = PolicyEvaluator::new(registry);
+
+        // Should match lowercase
+        let lower = create_test_log("an error occurred", "info", "svc", "host", "arn", None);
+        assert!(!evaluator.should_keep(&lower).await);
+
+        // Should match uppercase
+        let upper = create_test_log("an ERROR occurred", "info", "svc", "host", "arn", None);
+        assert!(!evaluator.should_keep(&upper).await);
+
+        // Should match mixed case
+        let mixed = create_test_log("an ErRoR occurred", "info", "svc", "host", "arn", None);
+        assert!(!evaluator.should_keep(&mixed).await);
+
+        // Should NOT match unrelated
+        let unrelated = create_test_log("all good", "info", "svc", "host", "arn", None);
+        assert!(evaluator.should_keep(&unrelated).await);
+    }
+
+    #[tokio::test]
+    async fn test_case_insensitive_exact_matching() {
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+
+        // Create policy with case_insensitive: true for exact match
+        let policy = case_insensitive_body_exact_policy("drop-hello-ci", "HELLO", "none", true);
+        handle.update(vec![policy]);
+
+        let evaluator = PolicyEvaluator::new(registry);
+
+        // Should match exact uppercase
+        let upper = create_test_log("HELLO", "info", "svc", "host", "arn", None);
+        assert!(!evaluator.should_keep(&upper).await);
+
+        // Should match lowercase
+        let lower = create_test_log("hello", "info", "svc", "host", "arn", None);
+        assert!(!evaluator.should_keep(&lower).await);
+
+        // Should match mixed case
+        let mixed = create_test_log("HeLLo", "info", "svc", "host", "arn", None);
+        assert!(!evaluator.should_keep(&mixed).await);
+
+        // Should NOT match partial
+        let partial = create_test_log("hello world", "info", "svc", "host", "arn", None);
+        assert!(evaluator.should_keep(&partial).await);
+    }
+
+    #[tokio::test]
+    async fn test_case_sensitive_vs_insensitive_comparison() {
+        // Test that case_insensitive: false (default) is case-sensitive
+        let registry_sensitive = Arc::new(PolicyRegistry::new());
+        let handle_sensitive = registry_sensitive.register_provider();
+        let policy_sensitive = body_regex_policy("drop-error-cs", "error", "none", true);
+        handle_sensitive.update(vec![policy_sensitive]);
+        let evaluator_sensitive = PolicyEvaluator::new(registry_sensitive);
+
+        // Test that case_insensitive: true is case-insensitive
+        let registry_insensitive = Arc::new(PolicyRegistry::new());
+        let handle_insensitive = registry_insensitive.register_provider();
+        let policy_insensitive =
+            case_insensitive_body_regex_policy("drop-error-ci", "error", "none", true);
+        handle_insensitive.update(vec![policy_insensitive]);
+        let evaluator_insensitive = PolicyEvaluator::new(registry_insensitive);
+
+        // Lowercase matches both
+        let lower = create_test_log("error message", "info", "svc", "host", "arn", None);
+        assert!(!evaluator_sensitive.should_keep(&lower).await);
+        assert!(!evaluator_insensitive.should_keep(&lower).await);
+
+        // Uppercase only matches case-insensitive
+        let upper = create_test_log("ERROR message", "info", "svc", "host", "arn", None);
+        assert!(evaluator_sensitive.should_keep(&upper).await); // case-sensitive doesn't match
+        assert!(!evaluator_insensitive.should_keep(&upper).await); // case-insensitive matches
+    }
+
+    // ==================== Sample Key Tests ====================
+
+    /// Helper to create a policy with a sample key for consistent sampling
+    fn sampled_policy_with_key(
+        id: &str,
+        pattern: &str,
+        keep: &str,
+        sample_key_attr: &str,
+        enabled: bool,
+    ) -> Policy {
+        use policy_rs::proto::tero::policy::v1::{LogSampleKey, log_sample_key};
+
+        let matcher = LogMatcher {
+            field: Some(log_matcher::Field::LogField(LogField::Body.into())),
+            r#match: Some(log_matcher::Match::Regex(pattern.to_string())),
+            negate: false,
+            case_insensitive: false,
+        };
+
+        let sample_key = LogSampleKey {
+            field: Some(log_sample_key::Field::ResourceAttribute(attr_path(
+                sample_key_attr,
+            ))),
+        };
+
+        let log_target = LogTarget {
+            r#match: vec![matcher],
+            keep: keep.to_string(),
+            transform: None,
+            sample_key: Some(sample_key),
+        };
+
+        let proto = ProtoPolicy {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled,
+            target: Some(policy_rs::proto::tero::policy::v1::policy::Target::Log(
+                log_target,
+            )),
+            ..Default::default()
+        };
+
+        Policy::new(proto)
+    }
+
+    #[tokio::test]
+    async fn test_sample_key_consistent_sampling() {
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+
+        // Sample 50% with request_id as sample key
+        // All logs with the same request_id should get the same decision
+        let policy = sampled_policy_with_key("sample-by-request", "Log", "50%", "request_id", true);
+        handle.update(vec![policy]);
+
+        let evaluator = PolicyEvaluator::new(registry);
+
+        // Create multiple logs with the same request_id
+        let request_id = "req-abc-123";
+        let mut decisions = Vec::new();
+
+        for i in 0..10 {
+            let log = create_test_log(
+                &format!("Log message {i}"),
+                "info",
+                "svc",
+                "host",
+                "arn",
+                Some(request_id),
+            );
+            decisions.push(evaluator.should_keep(&log).await);
+        }
+
+        // All decisions should be the same for the same request_id
+        let first_decision = decisions[0];
+        assert!(
+            decisions.iter().all(|&d| d == first_decision),
+            "All logs with the same request_id should have the same sampling decision"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sample_key_different_keys_different_decisions() {
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+
+        // Sample 50% with request_id as sample key
+        let policy = sampled_policy_with_key("sample-by-request", "Log", "50%", "request_id", true);
+        handle.update(vec![policy]);
+
+        let evaluator = PolicyEvaluator::new(registry);
+
+        // Generate many different request IDs and track decisions
+        let mut kept_count = 0;
+        let mut dropped_count = 0;
+        let total = 100;
+
+        for i in 0..total {
+            let request_id = format!("req-{i:04}");
+            let log = create_test_log(
+                "Log message",
+                "info",
+                "svc",
+                "host",
+                "arn",
+                Some(&request_id),
+            );
+            if evaluator.should_keep(&log).await {
+                kept_count += 1;
+            } else {
+                dropped_count += 1;
+            }
+        }
+
+        // With 50% sampling, we expect roughly half to be kept
+        let ratio = f64::from(kept_count) / f64::from(total);
+        assert!(
+            ratio > 0.3 && ratio < 0.7,
+            "Expected ~50% sampling ratio, got {ratio:.2} (kept={kept_count}, dropped={dropped_count})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sample_key_zero_percent_drops_all() {
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+
+        // 0% sampling with sample key - should drop all
+        let policy = sampled_policy_with_key("sample-zero", "Log", "0%", "request_id", true);
+        handle.update(vec![policy]);
+
+        let evaluator = PolicyEvaluator::new(registry);
+
+        for i in 0..10 {
+            let log = create_test_log(
+                "Log message",
+                "info",
+                "svc",
+                "host",
+                "arn",
+                Some(&format!("req-{i}")),
+            );
+            assert!(
+                !evaluator.should_keep(&log).await,
+                "0% sampling should drop all logs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sample_key_hundred_percent_keeps_all() {
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+
+        // 100% sampling with sample key - should keep all
+        let policy = sampled_policy_with_key("sample-all", "Log", "100%", "request_id", true);
+        handle.update(vec![policy]);
+
+        let evaluator = PolicyEvaluator::new(registry);
+
+        for i in 0..10 {
+            let log = create_test_log(
+                "Log message",
+                "info",
+                "svc",
+                "host",
+                "arn",
+                Some(&format!("req-{i}")),
+            );
+            assert!(
+                evaluator.should_keep(&log).await,
+                "100% sampling should keep all logs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sample_key_by_service() {
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+
+        // Sample by service name - all logs from the same service get the same decision
+        let policy = sampled_policy_with_key("sample-by-service", "Log", "50%", "service", true);
+        handle.update(vec![policy]);
+
+        let evaluator = PolicyEvaluator::new(registry);
+
+        // Multiple logs from "service-a" should all have the same decision
+        let mut service_a_decisions = Vec::new();
+        for i in 0..5 {
+            let log = create_test_log(
+                &format!("Log {i}"),
+                "info",
+                "service-a",
+                "host",
+                "arn",
+                None,
+            );
+            service_a_decisions.push(evaluator.should_keep(&log).await);
+        }
+
+        let first_a = service_a_decisions[0];
+        assert!(
+            service_a_decisions.iter().all(|&d| d == first_a),
+            "All logs from service-a should have the same decision"
+        );
+
+        // Multiple logs from "service-b" should all have the same decision
+        let mut service_b_decisions = Vec::new();
+        for i in 0..5 {
+            let log = create_test_log(
+                &format!("Log {i}"),
+                "info",
+                "service-b",
+                "host",
+                "arn",
+                None,
+            );
+            service_b_decisions.push(evaluator.should_keep(&log).await);
+        }
+
+        let first_b = service_b_decisions[0];
+        assert!(
+            service_b_decisions.iter().all(|&d| d == first_b),
+            "All logs from service-b should have the same decision"
+        );
     }
 
     // ==================== Policy Updates Tests ====================
