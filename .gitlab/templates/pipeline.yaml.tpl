@@ -274,7 +274,7 @@ publish image ({{ $multi_arch_image_flavor.name }}):
   variables:
     IMG_SOURCES: ${CI_DOCKER_TARGET_IMAGE}:v${CI_PIPELINE_ID}-${CI_COMMIT_SHORT_SHA}{{ $multi_arch_image_flavor.suffix }}
     IMG_DESTINATIONS: lambda-extension:${VERSION}{{ $multi_arch_image_flavor.suffix }},lambda-extension:latest{{ $multi_arch_image_flavor.suffix }}
-    IMG_REGISTRIES: dockerhub,ecr-public,gcr-datadoghq
+    IMG_REGISTRIES: public
     IMG_SIGNING: false
 
 {{ end }} # end multi_arch_image_flavors
@@ -330,7 +330,7 @@ signed layer bundle:
 build java lambdas:
   stage: integration-tests
   image: registry.ddbuild.io/images/docker:27.3.1
-  tags: ["docker-in-docker:microvm-arm64"]
+  tags: ["docker-in-docker:arm64"]
   rules:
     - when: on_success
   needs: []
@@ -349,7 +349,7 @@ build java lambdas:
 build dotnet lambdas:
   stage: integration-tests
   image: registry.ddbuild.io/images/docker:27.3.1
-  tags: ["docker-in-docker:microvm-arm64"]
+  tags: ["docker-in-docker:arm64"]
   rules:
     - when: on_success
   needs: []
@@ -368,7 +368,7 @@ build dotnet lambdas:
 build python lambdas:
   stage: integration-tests
   image: registry.ddbuild.io/images/docker:27.3.1
-  tags: ["docker-in-docker:microvm-arm64"]
+  tags: ["docker-in-docker:arm64"]
   rules:
     - when: on_success
   needs: []
@@ -387,7 +387,7 @@ build python lambdas:
 build node lambdas:
   stage: integration-tests
   image: registry.ddbuild.io/images/docker:27.3.1
-  tags: ["docker-in-docker:microvm-arm64"]
+  tags: ["docker-in-docker:arm64"]
   rules:
     - when: on_success
   needs: []

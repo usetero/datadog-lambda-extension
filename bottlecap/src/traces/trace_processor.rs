@@ -32,8 +32,8 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::SendError;
 use tracing::{debug, error};
 
-use super::stats_generator::StatsGenerator;
-use super::trace_aggregator::SendDataBuilderInfo;
+use crate::traces::stats_generator::StatsGenerator;
+use crate::traces::trace_aggregator::{OwnedTracerHeaderTags, SendDataBuilderInfo};
 
 #[derive(Clone)]
 #[allow(clippy::module_name_repetitions)]
@@ -51,11 +51,11 @@ struct ChunkProcessor {
 
 impl TraceChunkProcessor for ChunkProcessor {
     fn process(&mut self, chunk: &mut pb::TraceChunk, root_span_index: usize) {
-        if let Some(root_span) = chunk.spans.get(root_span_index) {
-            if filter_span_by_tags(root_span, &self.config) {
-                chunk.spans.clear();
-                return;
-            }
+        if let Some(root_span) = chunk.spans.get(root_span_index)
+            && filter_span_by_tags(root_span, &self.config)
+        {
+            chunk.spans.clear();
+            return;
         }
 
         chunk
@@ -75,10 +75,10 @@ impl TraceChunkProcessor for ChunkProcessor {
         for span in &mut chunk.spans {
             // Service name could be incorrectly set to 'aws.lambda'
             // in datadog lambda libraries
-            if span.service == "aws.lambda" {
-                if let Some(service) = self.tags_provider.get_tags_map().get("service") {
-                    span.service.clone_from(service);
-                }
+            if span.service == "aws.lambda"
+                && let Some(service) = self.tags_provider.get_tags_map().get("service")
+            {
+                span.service.clone_from(service);
             }
 
             // Remove the _dd.base_service tag for unintentional service name override
@@ -102,70 +102,70 @@ impl TraceChunkProcessor for ChunkProcessor {
 
 fn filter_span_by_tags(span: &Span, config: &config::Config) -> bool {
     // Handle required tags from DD_APM_FILTER_TAGS_REQUIRE (exact match)
-    if let Some(require_tags) = &config.apm_filter_tags_require {
-        if !require_tags.is_empty() {
-            let matches_require = require_tags
-                .iter()
-                .all(|filter| span_matches_tag_exact_filter(span, filter));
-            if !matches_require {
-                debug!(
-                    "TRACE_PROCESSOR | Filtering out span '{}' - doesn't match all required tags {}",
-                    span.name,
-                    require_tags.join(", ")
-                );
-                return true;
-            }
+    if let Some(require_tags) = &config.apm_filter_tags_require
+        && !require_tags.is_empty()
+    {
+        let matches_require = require_tags
+            .iter()
+            .all(|filter| span_matches_tag_exact_filter(span, filter));
+        if !matches_require {
+            debug!(
+                "TRACE_PROCESSOR | Filtering out span '{}' - doesn't match all required tags {}",
+                span.name,
+                require_tags.join(", ")
+            );
+            return true;
         }
     }
 
     // Handle required regex tags from DD_APM_FILTER_TAGS_REGEX_REQUIRE (regex match)
-    if let Some(require_regex_tags) = &config.apm_filter_tags_regex_require {
-        if !require_regex_tags.is_empty() {
-            let matches_require_regex = require_regex_tags
-                .iter()
-                .all(|filter| span_matches_tag_regex_filter(span, filter));
-            if !matches_require_regex {
-                debug!(
-                    "TRACE_PROCESSOR | Filtering out span '{}' - doesn't match all required regex tags {}",
-                    span.name,
-                    require_regex_tags.join(", ")
-                );
-                return true;
-            }
+    if let Some(require_regex_tags) = &config.apm_filter_tags_regex_require
+        && !require_regex_tags.is_empty()
+    {
+        let matches_require_regex = require_regex_tags
+            .iter()
+            .all(|filter| span_matches_tag_regex_filter(span, filter));
+        if !matches_require_regex {
+            debug!(
+                "TRACE_PROCESSOR | Filtering out span '{}' - doesn't match all required regex tags {}",
+                span.name,
+                require_regex_tags.join(", ")
+            );
+            return true;
         }
     }
 
     // Handle reject tags from DD_APM_FILTER_TAGS_REJECT (exact match)
-    if let Some(reject_tags) = &config.apm_filter_tags_reject {
-        if !reject_tags.is_empty() {
-            let matches_reject = reject_tags
-                .iter()
-                .any(|filter| span_matches_tag_exact_filter(span, filter));
-            if matches_reject {
-                debug!(
-                    "TRACE_PROCESSOR | Filtering out span '{}' - matches reject tags {}",
-                    span.name,
-                    reject_tags.join(", ")
-                );
-                return true;
-            }
+    if let Some(reject_tags) = &config.apm_filter_tags_reject
+        && !reject_tags.is_empty()
+    {
+        let matches_reject = reject_tags
+            .iter()
+            .any(|filter| span_matches_tag_exact_filter(span, filter));
+        if matches_reject {
+            debug!(
+                "TRACE_PROCESSOR | Filtering out span '{}' - matches reject tags {}",
+                span.name,
+                reject_tags.join(", ")
+            );
+            return true;
         }
     }
 
     // Handle reject regex tags from DD_APM_FILTER_TAGS_REGEX_REJECT (regex match)
-    if let Some(reject_regex_tags) = &config.apm_filter_tags_regex_reject {
-        if !reject_regex_tags.is_empty() {
-            let matches_reject_regex = reject_regex_tags
-                .iter()
-                .any(|filter| span_matches_tag_regex_filter(span, filter));
-            if matches_reject_regex {
-                debug!(
-                    "TRACE_PROCESSOR | Filtering out span '{}' - matches reject regex tags {}",
-                    span.name,
-                    reject_regex_tags.join(", ")
-                );
-                return true;
-            }
+    if let Some(reject_regex_tags) = &config.apm_filter_tags_regex_reject
+        && !reject_regex_tags.is_empty()
+    {
+        let matches_reject_regex = reject_regex_tags
+            .iter()
+            .any(|filter| span_matches_tag_regex_filter(span, filter));
+        if matches_reject_regex {
+            debug!(
+                "TRACE_PROCESSOR | Filtering out span '{}' - matches reject regex tags {}",
+                span.name,
+                reject_regex_tags.join(", ")
+            );
+            return true;
         }
     }
 
@@ -203,10 +203,10 @@ fn span_matches_tag_regex_filter(span: &Span, filter: &str) -> bool {
 }
 
 fn span_matches_tag_exact(span: &Span, key: &str, value: &str) -> bool {
-    if let Some(span_value) = span.meta.get(key) {
-        if span_value == value {
-            return true;
-        }
+    if let Some(span_value) = span.meta.get(key)
+        && span_value == value
+    {
+        return true;
     }
 
     let span_property_value = match key {
@@ -217,10 +217,10 @@ fn span_matches_tag_exact(span: &Span, key: &str, value: &str) -> bool {
         _ => None,
     };
 
-    if let Some(prop_value) = span_property_value {
-        if prop_value == value {
-            return true;
-        }
+    if let Some(prop_value) = span_property_value
+        && prop_value == value
+    {
+        return true;
     }
 
     false
@@ -235,10 +235,10 @@ fn span_matches_tag_regex(span: &Span, key: &str, value: &str) -> bool {
         return false;
     };
 
-    if let Some(span_value) = span.meta.get(key) {
-        if regex.is_match(span_value) {
-            return true;
-        }
+    if let Some(span_value) = span.meta.get(key)
+        && regex.is_match(span_value)
+    {
+        return true;
     }
 
     let span_property_value = match key {
@@ -248,10 +248,10 @@ fn span_matches_tag_regex(span: &Span, key: &str, value: &str) -> bool {
         "type" => Some(&span.r#type),
         _ => None,
     };
-    if let Some(prop_value) = span_property_value {
-        if regex.is_match(prop_value) {
-            return true;
-        }
+    if let Some(prop_value) = span_property_value
+        && regex.is_match(prop_value)
+    {
+        return true;
     }
 
     false
@@ -271,13 +271,12 @@ fn span_has_key(span: &Span, key: &str) -> bool {
 }
 
 fn filter_span_from_lambda_library_or_runtime(span: &Span) -> bool {
-    if let Some(url) = span.meta.get("http.url") {
-        if url.starts_with(LAMBDA_RUNTIME_URL_PREFIX)
+    if let Some(url) = span.meta.get("http.url")
+        && (url.starts_with(LAMBDA_RUNTIME_URL_PREFIX)
             || url.starts_with(LAMBDA_EXTENSION_URL_PREFIX)
-            || url.starts_with(LAMBDA_STATSD_URL_PREFIX)
-        {
-            return true;
-        }
+            || url.starts_with(LAMBDA_STATSD_URL_PREFIX))
+    {
+        return true;
     }
 
     if let (Some(tcp_host), Some(tcp_port)) = (
@@ -295,13 +294,12 @@ fn filter_span_from_lambda_library_or_runtime(span: &Span) -> bool {
         }
     }
 
-    if let Some(dns_address) = span.meta.get("dns.address") {
-        if dns_address.starts_with(DNS_NON_ROUTABLE_ADDRESS_URL_PREFIX)
+    if let Some(dns_address) = span.meta.get("dns.address")
+        && (dns_address.starts_with(DNS_NON_ROUTABLE_ADDRESS_URL_PREFIX)
             || dns_address.starts_with(DNS_LOCAL_HOST_ADDRESS_URL_PREFIX)
-            || dns_address.starts_with(AWS_XRAY_DAEMON_ADDRESS_URL_PREFIX)
-        {
-            return true;
-        }
+            || dns_address.starts_with(AWS_XRAY_DAEMON_ADDRESS_URL_PREFIX))
+    {
+        return true;
     }
     if span.resource == INVOCATION_SPAN_RESOURCE {
         return true;
@@ -373,9 +371,25 @@ impl TraceProcessor for ServerlessTraceProcessor {
             api_key: None,
             timeout_ms: config.flush_timeout * S_TO_MS,
             test_token: None,
+            use_system_resolver: false,
         };
 
-        let builder = SendDataBuilder::new(body_size, payload.clone(), header_tags, &endpoint)
+        // Clone inner V07 payloads for stats generation (TracerPayload is Clone,
+        // but TracerPayloadCollection is not).
+        let payloads_for_stats = match &payload {
+            TracerPayloadCollection::V07(payloads) => {
+                TracerPayloadCollection::V07(payloads.clone())
+            }
+            other => {
+                error!("TRACE_PROCESSOR | Unexpected payload type for stats: {other:?}");
+                TracerPayloadCollection::V07(vec![])
+            }
+        };
+
+        let owned_header_tags = OwnedTracerHeaderTags::from(header_tags.clone());
+
+        // Move original payload into builder (no clone needed)
+        let builder = SendDataBuilder::new(body_size, payload, header_tags, &endpoint)
             .with_compression(Compression::Zstd(config.apm_config_compression_level))
             .with_retry_strategy(RetryStrategy::new(
                 1,
@@ -384,7 +398,10 @@ impl TraceProcessor for ServerlessTraceProcessor {
                 None,
             ));
 
-        (SendDataBuilderInfo::new(builder, body_size), payload)
+        (
+            SendDataBuilderInfo::new(builder, body_size, owned_header_tags),
+            payloads_for_stats,
+        )
     }
 }
 
@@ -475,12 +492,12 @@ impl SendingTraceProcessor {
 
         // This needs to be after process_traces() because process_traces()
         // performs obfuscation, and we need to compute stats on the obfuscated traces.
-        if config.compute_trace_stats_on_extension {
-            if let Err(err) = self.stats_generator.send(&processed_traces) {
-                // Just log the error. We don't think trace stats are critical, so we don't want to
-                // return an error if only stats fail to send.
-                error!("TRACE_PROCESSOR | Error sending traces to the stats concentrator: {err}");
-            }
+        if config.compute_trace_stats_on_extension
+            && let Err(err) = self.stats_generator.send(&processed_traces)
+        {
+            // Just log the error. We don't think trace stats are critical, so we don't want to
+            // return an error if only stats fail to send.
+            error!("TRACE_PROCESSOR | Error sending traces to the stats concentrator: {err}");
         }
         Ok(())
     }

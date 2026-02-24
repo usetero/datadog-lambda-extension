@@ -107,7 +107,8 @@ impl Processor {
             &config.service.clone().unwrap_or(resource.clone()),
             "aws.lambda",
             config.trace_aws_service_representation_enabled,
-        );
+        )
+        .to_lowercase();
 
         let enhanced_metrics = EnhancedMetrics::new(metrics_aggregator, Arc::clone(&config));
         enhanced_metrics.start_usage_metrics_task(); // starts the long-running task that monitors usage metrics (fd_use, threads_use, tmp_used)
@@ -254,8 +255,13 @@ impl Processor {
             self.runtime = Some(runtime);
         }
 
-        self.dynamic_tags
-            .insert(String::from("cold_start"), cold_start.to_string());
+        // Skip cold_start tag in Managed Instance mode
+        // We don't want to send this tag for spans, as the experience
+        // won't look good due to the time gap in the flame graph.
+        if !self.aws_config.is_managed_instance_mode() {
+            self.dynamic_tags
+                .insert(String::from("cold_start"), cold_start.to_string());
+        }
 
         if proactive_initialization {
             self.dynamic_tags.insert(
@@ -266,7 +272,7 @@ impl Processor {
 
         if let Some(runtime) = &self.runtime {
             self.dynamic_tags
-                .insert(String::from("runtime"), runtime.to_string());
+                .insert(String::from("runtime"), runtime.clone());
             self.enhanced_metrics.set_runtime_tag(runtime);
         }
 
@@ -304,6 +310,14 @@ impl Processor {
             debug!("Cannot process on platform init start, no invocation context found");
             return;
         };
+
+        // Skip creating cold start span in Managed Instances
+        // Although the telemetry is correct, we instead decide
+        // to not send it since the flame graph would show a big
+        // gap between the init and the first invocation.
+        if self.aws_config.is_managed_instance_mode() {
+            return;
+        }
 
         // Create a cold start span
         let mut cold_start_span = create_empty_span(
@@ -499,11 +513,12 @@ impl Processor {
         let context = self.enrich_ctx_at_platform_done(request_id, status);
 
         if self.tracer_detected {
-            if let Some(ctx) = context {
-                if ctx.invocation_span.trace_id != 0 && ctx.invocation_span.span_id != 0 {
-                    self.send_ctx_spans(&tags_provider, &trace_sender, ctx)
-                        .await;
-                }
+            if let Some(ctx) = context
+                && ctx.invocation_span.trace_id != 0
+                && ctx.invocation_span.span_id != 0
+            {
+                self.send_ctx_spans(&tags_provider, &trace_sender, ctx)
+                    .await;
             }
         } else {
             self.send_cold_start_span(&tags_provider, &trace_sender)
@@ -566,19 +581,19 @@ impl Processor {
             .complete_inferred_spans(&context.invocation_span);
 
         // Handle cold start span if present
-        if let Some(cold_start_span) = &mut context.cold_start_span {
-            if context.invocation_span.trace_id != 0 {
-                cold_start_span.trace_id = context.invocation_span.trace_id;
-                cold_start_span.parent_id = context.invocation_span.parent_id;
-            }
+        if let Some(cold_start_span) = &mut context.cold_start_span
+            && context.invocation_span.trace_id != 0
+        {
+            cold_start_span.trace_id = context.invocation_span.trace_id;
+            cold_start_span.parent_id = context.invocation_span.parent_id;
         }
 
         // Handle snapstart restore span if present
-        if let Some(snapstart_restore_span) = &mut context.snapstart_restore_span {
-            if context.invocation_span.trace_id != 0 {
-                snapstart_restore_span.trace_id = context.invocation_span.trace_id;
-                snapstart_restore_span.parent_id = context.invocation_span.parent_id;
-            }
+        if let Some(snapstart_restore_span) = &mut context.snapstart_restore_span
+            && context.invocation_span.trace_id != 0
+        {
+            snapstart_restore_span.trace_id = context.invocation_span.trace_id;
+            snapstart_restore_span.parent_id = context.invocation_span.parent_id;
         }
         Some(context.clone())
     }
@@ -626,14 +641,14 @@ impl Processor {
     /// For Node/Python: Updates the cold start span with the given trace ID.
     /// Returns the Span ID of the cold start span so we can reparent the `aws.lambda.load` span.
     pub fn set_cold_start_span_trace_id(&mut self, trace_id: u64) -> Option<u64> {
-        if let Some(cold_start_context) = self.context_buffer.get_context_with_cold_start() {
-            if let Some(cold_start_span) = &mut cold_start_context.cold_start_span {
-                if cold_start_span.trace_id == 0 {
-                    cold_start_span.trace_id = trace_id;
-                }
-
-                return Some(cold_start_span.span_id);
+        if let Some(cold_start_context) = self.context_buffer.get_context_with_cold_start()
+            && let Some(cold_start_span) = &mut cold_start_context.cold_start_span
+        {
+            if cold_start_span.trace_id == 0 {
+                cold_start_span.trace_id = trace_id;
             }
+
+            return Some(cold_start_span.span_id);
         }
 
         None
@@ -645,19 +660,19 @@ impl Processor {
         tags_provider: &Arc<provider::Provider>,
         trace_sender: &Arc<SendingTraceProcessor>,
     ) {
-        if let Some(cold_start_context) = self.context_buffer.get_context_with_cold_start() {
-            if let Some(cold_start_span) = &mut cold_start_context.cold_start_span {
-                if cold_start_span.trace_id == 0 {
-                    debug!("Not sending cold start span because trace ID is unset.");
-                    return;
-                }
-
-                let traces = vec![cold_start_span.clone()];
-                let body_size = size_of_val(cold_start_span);
-
-                self.send_spans(traces, body_size, tags_provider, trace_sender)
-                    .await;
+        if let Some(cold_start_context) = self.context_buffer.get_context_with_cold_start()
+            && let Some(cold_start_span) = &mut cold_start_context.cold_start_span
+        {
+            if cold_start_span.trace_id == 0 {
+                debug!("Not sending cold start span because trace ID is unset.");
+                return;
             }
+
+            let traces = vec![cold_start_span.clone()];
+            let body_size = size_of_val(cold_start_span);
+
+            self.send_spans(traces, body_size, tags_provider, trace_sender)
+                .await;
         }
     }
 
@@ -742,13 +757,13 @@ impl Processor {
         }
 
         // Set Network and CPU time metrics
-        if let Some(context) = self.context_buffer.get(request_id) {
-            if let Some(offsets) = &context.enhanced_metric_data {
-                self.enhanced_metrics
-                    .set_network_enhanced_metrics(offsets.network_offset);
-                self.enhanced_metrics
-                    .set_cpu_time_enhanced_metrics(offsets.cpu_offset.clone());
-            }
+        if let Some(context) = self.context_buffer.get(request_id)
+            && let Some(offsets) = &context.enhanced_metric_data
+        {
+            self.enhanced_metrics
+                .set_network_enhanced_metrics(offsets.network_offset);
+            self.enhanced_metrics
+                .set_cpu_time_enhanced_metrics(offsets.cpu_offset.clone());
         }
     }
 
@@ -831,24 +846,23 @@ impl Processor {
         // For provided.al runtimes, if the last invocation hit the memory limit, increment the OOM metric.
         // We do this for provided.al runtimes because we didn't find another way to detect this under provided.al.
         // We don't do this for other runtimes to avoid double counting.
-        if let Some(runtime) = &self.runtime {
-            if runtime.starts_with("provided.al")
-                && metrics.max_memory_used_mb == metrics.memory_size_mb
-            {
-                debug!(
-                    "Invocation Processor | PlatformReport | Last invocation hit memory limit. Incrementing OOM metric."
-                );
-                self.enhanced_metrics.increment_oom_metric(timestamp);
-            }
+        if let Some(runtime) = &self.runtime
+            && runtime.starts_with("provided.al")
+            && metrics.max_memory_used_mb == metrics.memory_size_mb
+        {
+            debug!(
+                "Invocation Processor | PlatformReport | Last invocation hit memory limit. Incrementing OOM metric."
+            );
+            self.enhanced_metrics.increment_oom_metric(timestamp);
         }
 
         // Calculate and set post-runtime duration if context is available
-        if let Some(context) = self.context_buffer.get(request_id) {
-            if context.runtime_duration_ms != 0.0 {
-                let post_runtime_duration_ms = metrics.duration_ms - context.runtime_duration_ms;
-                self.enhanced_metrics
-                    .set_post_runtime_duration_metric(post_runtime_duration_ms, timestamp);
-            }
+        if let Some(context) = self.context_buffer.get(request_id)
+            && context.runtime_duration_ms != 0.0
+        {
+            let post_runtime_duration_ms = metrics.duration_ms - context.runtime_duration_ms;
+            self.enhanced_metrics
+                .set_post_runtime_duration_metric(post_runtime_duration_ms, timestamp);
         }
     }
 
@@ -1062,11 +1076,20 @@ impl Processor {
             return Some(sc);
         }
 
-        if let Some(payload_headers) = payload_value.get("headers") {
-            if let Some(sc) = propagator.extract(payload_headers) {
-                debug!("Extracted trace context from event headers");
-                return Some(sc);
-            }
+        if let Some(sc) = payload_value
+            .get("request")
+            .and_then(|req| req.get("headers"))
+            .and_then(|headers| propagator.extract(headers))
+        {
+            debug!("Extracted trace context from event.request.headers");
+            return Some(sc);
+        }
+
+        if let Some(payload_headers) = payload_value.get("headers")
+            && let Some(sc) = propagator.extract(payload_headers)
+        {
+            debug!("Extracted trace context from event headers");
+            return Some(sc);
         }
 
         if let Some(sc) = propagator.extract(headers) {
@@ -1189,13 +1212,13 @@ impl Processor {
                 parent_id = header.parse::<u64>().unwrap_or(0);
             }
 
-            if let Some(priority_str) = headers.get(DATADOG_SAMPLING_PRIORITY_KEY) {
-                if let Ok(priority) = priority_str.parse::<f64>() {
-                    context
-                        .invocation_span
-                        .metrics
-                        .insert(TAG_SAMPLING_PRIORITY.to_string(), priority);
-                }
+            if let Some(priority_str) = headers.get(DATADOG_SAMPLING_PRIORITY_KEY)
+                && let Ok(priority) = priority_str.parse::<f64>()
+            {
+                context
+                    .invocation_span
+                    .metrics
+                    .insert(TAG_SAMPLING_PRIORITY.to_string(), priority);
             }
 
             // Extract tags from headers
@@ -1265,7 +1288,7 @@ impl Processor {
         if let Some(m) = message {
             let decoded_message = base64_to_string(m).unwrap_or_else(|_| {
                 debug!("Error message header may not be encoded, setting as is");
-                m.to_string()
+                m.clone()
             });
 
             error_tags.insert(String::from("error.msg"), decoded_message);
@@ -1274,7 +1297,7 @@ impl Processor {
         if let Some(t) = r#type {
             let decoded_type = base64_to_string(t).unwrap_or_else(|_| {
                 debug!("Error type header may not be encoded, setting as is");
-                t.to_string()
+                t.clone()
             });
 
             error_tags.insert(String::from("error.type"), decoded_type);
@@ -1283,7 +1306,7 @@ impl Processor {
         if let Some(s) = stack {
             let decoded_stack = base64_to_string(s).unwrap_or_else(|e| {
                 debug!("Failed to decode error stack: {e}");
-                s.to_string()
+                s.clone()
             });
 
             error_tags.insert(String::from("error.stack"), decoded_stack);
@@ -1835,6 +1858,73 @@ mod tests {
         assert_eq!(
             spans[1].span_id, 3,
             "Should be snapstart span (id=3), not cold start span (id=2)"
+        );
+    }
+
+    #[test]
+    fn test_extract_span_context_priority_order() {
+        let config = Arc::new(config::Config {
+            trace_propagation_style_extract: vec![
+                config::trace_propagation_style::TracePropagationStyle::Datadog,
+                config::trace_propagation_style::TracePropagationStyle::TraceContext,
+            ],
+            ..config::Config::default()
+        });
+        let propagator = Arc::new(DatadogCompositePropagator::new(Arc::clone(&config)));
+
+        let mut headers = HashMap::new();
+        headers.insert(DATADOG_TRACE_ID_KEY.to_string(), "111".to_string());
+        headers.insert(DATADOG_PARENT_ID_KEY.to_string(), "222".to_string());
+
+        let payload = json!({
+            "headers": {
+                "x-datadog-trace-id": "333",
+                "x-datadog-parent-id": "444"
+            },
+            "request": {
+                "headers": {
+                    "x-datadog-trace-id": "555",
+                    "x-datadog-parent-id": "666"
+                }
+            }
+        });
+
+        let result = Processor::extract_span_context(&headers, &payload, propagator);
+
+        assert!(result.is_some());
+        let context = result.unwrap();
+        assert_eq!(
+            context.trace_id, 555,
+            "Should prioritize event.request.headers as service-specific extraction"
+        );
+    }
+
+    #[test]
+    fn test_extract_span_context_no_request_headers() {
+        let config = Arc::new(config::Config {
+            trace_propagation_style_extract: vec![
+                config::trace_propagation_style::TracePropagationStyle::Datadog,
+                config::trace_propagation_style::TracePropagationStyle::TraceContext,
+            ],
+            ..config::Config::default()
+        });
+        let propagator = Arc::new(DatadogCompositePropagator::new(Arc::clone(&config)));
+        let headers = HashMap::new();
+
+        let payload = json!({
+            "argumentsMap": {
+                "id": "123"
+            },
+            "request": {
+                "body": "some body"
+            }
+        });
+
+        let result = Processor::extract_span_context(&headers, &payload, propagator);
+
+        assert!(
+            result.is_none(),
+            "Should return None when no trace context found"
         );
     }
 }
