@@ -482,11 +482,11 @@ impl LambdaProcessor {
         }
 
         // Policy evaluation - check if the log should be kept
-        if let Some(evaluator) = &self.policy_evaluator {
-            if !evaluator.should_keep_sync(&log) {
-                debug!("LOGS | Dropping log due to policy");
-                return;
-            }
+        if let Some(evaluator) = &self.policy_evaluator
+            && !evaluator.should_keep_sync(&log)
+        {
+            debug!("LOGS | Dropping log due to policy");
+            return;
         }
 
         if let Ok(serialized_log) = serde_json::to_string(&log) {

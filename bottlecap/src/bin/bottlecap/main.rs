@@ -94,7 +94,6 @@ use dogstatsd::{
     metric::{EMPTY_TAGS, SortedTags},
 };
 use libdd_trace_obfuscation::obfuscation_config;
-use libdd_trace_utils::send_data::SendData;
 use policy_rs::{
     ContentType, HttpProvider, HttpProviderConfig, PolicyRegistry,
     otel_common::{AnyValue, KeyValue, any_value},
