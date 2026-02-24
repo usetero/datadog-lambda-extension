@@ -305,4 +305,120 @@ mod tests {
             None
         );
     }
+
+    // IntakeLog coverage gaps
+
+    #[test]
+    fn test_intake_log_source_resource_attribute() {
+        let log = create_test_intake_log();
+        assert_eq!(
+            log.get_field(&LogFieldSelector::ResourceAttribute(vec![
+                "source".to_string()
+            ]))
+            .as_deref(),
+            Some("lambda")
+        );
+    }
+
+    #[test]
+    fn test_intake_log_host_alias() {
+        let log = create_test_intake_log();
+        assert_eq!(
+            log.get_field(&LogFieldSelector::ResourceAttribute(vec![
+                "host".to_string()
+            ]))
+            .as_deref(),
+            Some("test-host")
+        );
+    }
+
+    #[test]
+    fn test_intake_log_unknown_resource_attribute() {
+        let log = create_test_intake_log();
+        assert_eq!(
+            log.get_field(&LogFieldSelector::ResourceAttribute(vec![
+                "unknown_field".to_string()
+            ]))
+            .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_intake_log_scope_attribute_returns_none() {
+        let log = create_test_intake_log();
+        assert_eq!(
+            log.get_field(&LogFieldSelector::ScopeAttribute(vec![
+                "anything".to_string()
+            ]))
+            .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_intake_log_unsupported_simple_field_returns_none() {
+        let log = create_test_intake_log();
+        assert_eq!(
+            log.get_field(&LogFieldSelector::Simple(LogField::Unspecified))
+                .as_deref(),
+            None
+        );
+    }
+
+    // SpanWrapper coverage gaps
+
+    #[test]
+    fn test_span_resource_field() {
+        let span = create_test_span();
+        let wrapper = SpanWrapper(&span);
+        assert_eq!(
+            wrapper
+                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                    "resource".to_string()
+                ]))
+                .as_deref(),
+            Some("/api/users")
+        );
+    }
+
+    #[test]
+    fn test_span_unknown_resource_attribute() {
+        let span = create_test_span();
+        let wrapper = SpanWrapper(&span);
+        assert_eq!(
+            wrapper
+                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                    "unknown_field".to_string()
+                ]))
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_span_scope_attribute_returns_none() {
+        let span = create_test_span();
+        let wrapper = SpanWrapper(&span);
+        assert_eq!(
+            wrapper
+                .get_field(&LogFieldSelector::ScopeAttribute(vec![
+                    "anything".to_string()
+                ]))
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_span_unsupported_simple_field_returns_none() {
+        let span = create_test_span();
+        let wrapper = SpanWrapper(&span);
+        assert_eq!(
+            wrapper
+                .get_field(&LogFieldSelector::Simple(LogField::SeverityText))
+                .as_deref(),
+            None
+        );
+    }
 }

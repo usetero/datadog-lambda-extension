@@ -1,73 +1,50 @@
 // Copyright 2023-Present Datadog, Inc. https://www.datadoghq.com/
 // SPDX-License-Identifier: Apache-2.0
 
-use async_trait::async_trait;
 use dogstatsd::api_key::ApiKeyFactory;
-use hyper_http_proxy;
-use hyper_rustls::HttpsConnectorBuilder;
-use libdd_common::{Endpoint, GenericHttpClient, hyper_migration};
+use libdd_common::Endpoint;
 use libdd_trace_utils::{
     config_utils::trace_intake_url_prefixed,
-    send_data::SendDataBuilder,
-    trace_utils::{self, SendData},
+    send_data::SendData,
+    trace_utils::{self},
+    tracer_payload::TracerPayloadCollection,
 };
-use rustls::RootCertStore;
-use rustls_pki_types::CertificateDer;
-use std::error::Error;
-use std::fs::File;
-use std::io::BufReader;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::LazyLock;
+use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
 use tracing::{debug, error};
 
 use crate::config::Config;
 use crate::lifecycle::invocation::processor::S_TO_MS;
+use crate::traces::http_client::{self, HttpClient};
 use crate::traces::trace_aggregator_service::AggregatorHandle;
 
-#[async_trait]
-pub trait TraceFlusher {
-    fn new(
-        aggregator_handle: AggregatorHandle,
-        config: Arc<Config>,
-        api_key_factory: Arc<ApiKeyFactory>,
-    ) -> Self
-    where
-        Self: Sized;
-    /// Given a `Vec<SendData>`, a tracer payload, send it to the Datadog intake endpoint.
-    /// Returns the traces back if there was an error sending them.
-    async fn send(
-        traces: Vec<SendData>,
-        endpoint: Option<&Endpoint>,
-        proxy_https: &Option<String>,
-        tls_cert_file: &Option<String>,
-    ) -> Option<Vec<SendData>>;
-
-    /// Flushes traces by getting every available batch on the aggregator.
-    /// If `failed_traces` is provided, it will attempt to send those instead of fetching new traces.
-    /// Returns any traces that failed to send and should be retried.
-    async fn flush(&self, failed_traces: Option<Vec<SendData>>) -> Option<Vec<SendData>>;
-}
-
-#[derive(Clone)]
-#[allow(clippy::module_name_repetitions)]
-pub struct ServerlessTraceFlusher {
+pub struct TraceFlusher {
     pub aggregator_handle: AggregatorHandle,
     pub config: Arc<Config>,
     pub api_key_factory: Arc<ApiKeyFactory>,
+    /// Additional endpoints for dual-shipping traces to multiple Datadog sites.
+    /// Configured via `DD_APM_ADDITIONAL_ENDPOINTS` (e.g., sending to both US and EU).
+    /// Each trace batch is sent to the primary endpoint AND all additional endpoints.
     pub additional_endpoints: Vec<Endpoint>,
+    /// Cached HTTP client, lazily initialized on first use.
+    /// TODO: `TraceFlusher` and `StatsFlusher` both hit trace.agent.datadoghq.{site} and could
+    /// share a single HTTP client for better connection pooling.
+    http_client: OnceCell<HttpClient>,
 }
 
-#[async_trait]
-impl TraceFlusher for ServerlessTraceFlusher {
-    fn new(
+impl TraceFlusher {
+    #[must_use]
+    pub fn new(
         aggregator_handle: AggregatorHandle,
         config: Arc<Config>,
         api_key_factory: Arc<ApiKeyFactory>,
     ) -> Self {
+        // Parse additional endpoints for dual-shipping from config.
+        // Format: { "https://trace.agent.datadoghq.eu": ["api-key-1", "api-key-2"], ... }
+        // Each URL + API key combination becomes a separate endpoint.
         let mut additional_endpoints: Vec<Endpoint> = Vec::new();
-
         for (endpoint_url, api_keys) in config.apm_additional_endpoints.clone() {
             for api_key in api_keys {
                 let trace_intake_url = trace_intake_url_prefixed(&endpoint_url);
@@ -77,21 +54,25 @@ impl TraceFlusher for ServerlessTraceFlusher {
                     api_key: Some(api_key.clone().into()),
                     timeout_ms: config.flush_timeout * S_TO_MS,
                     test_token: None,
+                    use_system_resolver: false,
                 };
-
                 additional_endpoints.push(endpoint);
             }
         }
 
-        ServerlessTraceFlusher {
+        TraceFlusher {
             aggregator_handle,
             config,
             api_key_factory,
             additional_endpoints,
+            http_client: OnceCell::new(),
         }
     }
 
-    async fn flush(&self, failed_traces: Option<Vec<SendData>>) -> Option<Vec<SendData>> {
+    /// Flushes traces by getting every available batch on the aggregator.
+    /// If `failed_traces` is provided, it will attempt to send those instead of fetching new traces.
+    /// Returns any traces that failed to send and should be retried.
+    pub async fn flush(&self, failed_traces: Option<Vec<SendData>>) -> Option<Vec<SendData>> {
         let Some(api_key) = self.api_key_factory.get_api_key().await else {
             error!(
                 "TRACES | Failed to resolve API key, dropping aggregated data and skipping flushing."
@@ -102,22 +83,22 @@ impl TraceFlusher for ServerlessTraceFlusher {
             return None;
         };
 
+        // Get or create the cached HTTP client
+        let Some(http_client) = self.get_or_init_http_client().await else {
+            error!("TRACES | Failed to create HTTP client, skipping flush");
+            return None;
+        };
+
         let mut failed_batch: Vec<SendData> = Vec::new();
 
         if let Some(traces) = failed_traces {
-            // If we have traces from a previous failed attempt, try to send those first
+            // If we have traces from a previous failed attempt, try to send those first.
             if !traces.is_empty() {
                 debug!(
                     "TRACES | Retrying to send {} previously failed batches",
                     traces.len()
                 );
-                let retry_result = Self::send(
-                    traces,
-                    None,
-                    &self.config.proxy_https,
-                    &self.config.tls_cert_file,
-                )
-                .await;
+                let retry_result = Self::send_traces(traces, http_client.clone()).await;
                 if retry_result.is_some() {
                     // Still failed, return to retry later
                     return retry_result;
@@ -136,28 +117,43 @@ impl TraceFlusher for ServerlessTraceFlusher {
         let mut batch_tasks = JoinSet::new();
 
         for trace_builders in all_batches {
-            let traces: Vec<_> = trace_builders
+            let traces_with_tags: Vec<_> = trace_builders
                 .into_iter()
-                .map(|builder| builder.with_api_key(api_key.as_str()))
-                .map(SendDataBuilder::build)
+                .map(|info| {
+                    let trace = info.builder.with_api_key(api_key.as_str()).build();
+                    (trace, info.header_tags)
+                })
                 .collect();
 
-            let traces_clone = traces.clone();
-            let proxy_https = self.config.proxy_https.clone();
-            let tls_cert_file = self.config.tls_cert_file.clone();
-            batch_tasks.spawn(async move {
-                Self::send(traces_clone, None, &proxy_https, &tls_cert_file).await
-            });
-
+            // Send to ADDITIONAL endpoints for dual-shipping.
+            // Construct separate SendData objects per endpoint by cloning the inner
+            // V07 payload data (TracerPayload is Clone, but SendData is not).
             for endpoint in self.additional_endpoints.clone() {
-                let traces_clone = traces.clone();
-                let proxy_https = self.config.proxy_https.clone();
-                let tls_cert_file = self.config.tls_cert_file.clone();
-                batch_tasks.spawn(async move {
-                    Self::send(traces_clone, Some(&endpoint), &proxy_https, &tls_cert_file).await
-                });
+                let additional_traces: Vec<_> = traces_with_tags
+                    .iter()
+                    .filter_map(|(trace, tags)| match trace.get_payloads() {
+                        TracerPayloadCollection::V07(payloads) => Some(SendData::new(
+                            trace.len(),
+                            TracerPayloadCollection::V07(payloads.clone()),
+                            tags.to_tracer_header_tags(),
+                            &endpoint,
+                        )),
+                        // All payloads in the extension are V07 (produced by
+                        // collect_pb_trace_chunks), so this branch is unreachable.
+                        _ => None,
+                    })
+                    .collect();
+                let client_clone = http_client.clone();
+                batch_tasks
+                    .spawn(async move { Self::send_traces(additional_traces, client_clone).await });
             }
+
+            // Send to PRIMARY endpoint (moves traces into the task).
+            let traces: Vec<_> = traces_with_tags.into_iter().map(|(t, _)| t).collect();
+            let client_clone = http_client.clone();
+            batch_tasks.spawn(async move { Self::send_traces(traces, client_clone).await });
         }
+        // Collect failed traces from all endpoints (primary + additional).
         while let Some(result) = batch_tasks.join_next().await {
             if let Ok(Some(mut failed)) = result {
                 failed_batch.append(&mut failed);
@@ -171,12 +167,37 @@ impl TraceFlusher for ServerlessTraceFlusher {
         None
     }
 
-    async fn send(
-        traces: Vec<SendData>,
-        endpoint: Option<&Endpoint>,
-        proxy_https: &Option<String>,
-        tls_cert_file: &Option<String>,
-    ) -> Option<Vec<SendData>> {
+    /// Returns a clone of the cached HTTP client, initializing it if necessary.
+    ///
+    /// The client is created once and reused for all subsequent flushes,
+    /// providing connection pooling and TLS session reuse.
+    ///
+    /// Returns `None` if client creation fails. The error is logged but not cached,
+    /// allowing retry on subsequent calls.
+    async fn get_or_init_http_client(&self) -> Option<HttpClient> {
+        match self
+            .http_client
+            .get_or_try_init(|| async {
+                http_client::create_client(
+                    self.config.proxy_https.as_ref(),
+                    self.config.tls_cert_file.as_ref(),
+                )
+            })
+            .await
+        {
+            Ok(client) => Some(client.clone()),
+            Err(e) => {
+                error!("TRACES | Failed to create HTTP client: {e}");
+                None
+            }
+        }
+    }
+
+    /// Sends traces to the Datadog intake endpoint using the provided HTTP client.
+    ///
+    /// Each `SendData` is sent to its own configured target endpoint.
+    /// Returns the traces back (by value) if there was an error sending them (for retry).
+    async fn send_traces(traces: Vec<SendData>, http_client: HttpClient) -> Option<Vec<SendData>> {
         if traces.is_empty() {
             return None;
         }
@@ -185,107 +206,16 @@ impl TraceFlusher for ServerlessTraceFlusher {
         tokio::task::yield_now().await;
         debug!("TRACES | Flushing {} traces", coalesced_traces.len());
 
-        let Ok(http_client) =
-            ServerlessTraceFlusher::get_http_client(proxy_https.as_ref(), tls_cert_file.as_ref())
-        else {
-            error!("TRACES | Failed to create HTTP client");
-            return None;
-        };
-
         for trace in &coalesced_traces {
-            let trace_with_endpoint = match endpoint {
-                Some(additional_endpoint) => trace.with_endpoint(additional_endpoint.clone()),
-                None => trace.clone(),
-            };
-
-            let send_result = trace_with_endpoint.send(&http_client).await.last_result;
+            let send_result = trace.send(&http_client).await.last_result;
 
             if let Err(e) = send_result {
                 error!("TRACES | Request failed: {e:?}");
-                // Return the original traces for retry
-                return Some(coalesced_traces.clone());
+                return Some(coalesced_traces);
             }
         }
 
         debug!("TRACES | Flushing took {} ms", start.elapsed().as_millis());
         None
-    }
-}
-
-// Initialize the crypto provider needed for setting custom root certificates
-fn ensure_crypto_provider_initialized() {
-    static INIT_CRYPTO_PROVIDER: LazyLock<()> = LazyLock::new(|| {
-        #[cfg(unix)]
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .expect("Failed to install default CryptoProvider");
-    });
-
-    let () = &*INIT_CRYPTO_PROVIDER;
-}
-
-impl ServerlessTraceFlusher {
-    pub fn get_http_client(
-        proxy_https: Option<&String>,
-        tls_cert_file: Option<&String>,
-    ) -> Result<
-        GenericHttpClient<hyper_http_proxy::ProxyConnector<libdd_common::connector::Connector>>,
-        Box<dyn Error>,
-    > {
-        // Create the base connector with optional custom TLS config
-        let connector = if let Some(ca_cert_path) = tls_cert_file {
-            // Ensure crypto provider is initialized before creating TLS config
-            ensure_crypto_provider_initialized();
-
-            // Load the custom certificate
-            let cert_file = File::open(ca_cert_path)?;
-            let mut reader = BufReader::new(cert_file);
-            let certs: Vec<CertificateDer> =
-                rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()?;
-
-            // Create a root certificate store and add custom certs
-            let mut root_store = RootCertStore::empty();
-            for cert in certs {
-                root_store.add(cert)?;
-            }
-
-            // Build the TLS config with custom root certificates
-            let tls_config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth();
-
-            // Build the HTTPS connector with custom config
-            let https_connector = HttpsConnectorBuilder::new()
-                .with_tls_config(tls_config)
-                .https_or_http()
-                .enable_http1()
-                .build();
-
-            debug!(
-                "TRACES | GET_HTTP_CLIENT | Added root certificate from {}",
-                ca_cert_path
-            );
-
-            // Construct the Connector::Https variant directly
-            libdd_common::connector::Connector::Https(https_connector)
-        } else {
-            // Use default connector
-            libdd_common::connector::Connector::default()
-        };
-
-        if let Some(proxy) = proxy_https {
-            let proxy =
-                hyper_http_proxy::Proxy::new(hyper_http_proxy::Intercept::Https, proxy.parse()?);
-            let proxy_connector = hyper_http_proxy::ProxyConnector::from_proxy(connector, proxy)?;
-            let client = hyper_migration::client_builder().build(proxy_connector);
-            debug!(
-                "TRACES | GET_HTTP_CLIENT | Proxy connector created with proxy: {:?}",
-                proxy_https
-            );
-            Ok(client)
-        } else {
-            let proxy_connector = hyper_http_proxy::ProxyConnector::new(connector)?;
-            Ok(hyper_migration::client_builder().build(proxy_connector))
-        }
     }
 }

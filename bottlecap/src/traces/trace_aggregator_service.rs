@@ -1,4 +1,3 @@
-use libdd_trace_utils::send_data::SendDataBuilder;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error};
 
@@ -7,8 +6,8 @@ use crate::traces::trace_aggregator::{
 };
 
 pub enum AggregatorCommand {
-    InsertPayload(SendDataBuilderInfo),
-    GetBatches(oneshot::Sender<Vec<Vec<SendDataBuilder>>>),
+    InsertPayload(Box<SendDataBuilderInfo>),
+    GetBatches(oneshot::Sender<Vec<Vec<SendDataBuilderInfo>>>),
     Clear,
     Shutdown,
 }
@@ -23,10 +22,11 @@ impl AggregatorHandle {
         &self,
         payload_info: SendDataBuilderInfo,
     ) -> Result<(), mpsc::error::SendError<AggregatorCommand>> {
-        self.tx.send(AggregatorCommand::InsertPayload(payload_info))
+        self.tx
+            .send(AggregatorCommand::InsertPayload(Box::new(payload_info)))
     }
 
-    pub async fn get_batches(&self) -> Result<Vec<Vec<SendDataBuilder>>, String> {
+    pub async fn get_batches(&self) -> Result<Vec<Vec<SendDataBuilderInfo>>, String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.tx
             .send(AggregatorCommand::GetBatches(response_tx))
@@ -75,7 +75,7 @@ impl AggregatorService {
         while let Some(command) = self.rx.recv().await {
             match command {
                 AggregatorCommand::InsertPayload(payload_info) => {
-                    self.aggregator.add(payload_info);
+                    self.aggregator.add(*payload_info);
                 }
                 AggregatorCommand::GetBatches(response_tx) => {
                     let mut batches = Vec::new();
@@ -104,9 +104,11 @@ impl AggregatorService {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::traces::trace_aggregator::OwnedTracerHeaderTags;
     use libdd_common::Endpoint;
     use libdd_trace_utils::{
-        trace_utils::TracerHeaderTags, tracer_payload::TracerPayloadCollection,
+        send_data::SendDataBuilder, trace_utils::TracerHeaderTags,
+        tracer_payload::TracerPayloadCollection,
     };
 
     #[tokio::test]
@@ -130,6 +132,7 @@ mod tests {
             dropped_p0_spans: 0,
         };
         let size = 1;
+        let owned_tags = OwnedTracerHeaderTags::from(tracer_header_tags.clone());
         let payload = SendDataBuilder::new(
             size,
             TracerPayloadCollection::V07(Vec::new()),
@@ -138,7 +141,7 @@ mod tests {
         );
 
         handle
-            .insert_payload(SendDataBuilderInfo::new(payload, size))
+            .insert_payload(SendDataBuilderInfo::new(payload, size, owned_tags))
             .unwrap();
 
         let batches = handle.get_batches().await.unwrap();

@@ -9,7 +9,7 @@ ARG DEBUG
 # The crate vendors its own Boost headers, but we install boost-devel for safety
 RUN --mount=type=cache,target=/var/cache/yum \
     yum install -y clang compiler-rt curl go make perl unzip tar gzip \
-    pkgconfig openssl-devel patch boost-devel sqlite-devel libpcap-devel
+    pkgconfig openssl-snapsafe-devel patch boost-devel sqlite-devel libpcap-devel
 
 # Install CMake >= 3.18.4 (AL2's cmake3 is too old at 3.17.5)
 ARG CMAKE_VERSION=3.28.3

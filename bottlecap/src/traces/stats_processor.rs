@@ -12,12 +12,12 @@ use axum::{
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error};
 
-use libdd_common::hyper_migration;
+use libdd_common::http_common;
 use libdd_trace_protobuf::pb;
 use libdd_trace_utils::stats_utils;
 
-use super::trace_agent::MAX_CONTENT_LENGTH;
 use crate::http::extract_request_body;
+use crate::traces::trace_agent::MAX_CONTENT_LENGTH;
 
 #[async_trait]
 pub trait StatsProcessor {
@@ -51,24 +51,22 @@ impl StatsProcessor for ServerlessStatsProcessor {
             }
         };
 
-        if let Some(content_length) = parts.headers.get("content-length") {
-            if let Ok(length_str) = content_length.to_str() {
-                if let Ok(length) = length_str.parse::<usize>() {
-                    if length > MAX_CONTENT_LENGTH {
-                        let error_msg = format!(
-                            "Content-Length {length} exceeds maximum allowed size {MAX_CONTENT_LENGTH}"
-                        );
-                        error!("{}", error_msg);
-                        return Ok((StatusCode::PAYLOAD_TOO_LARGE, error_msg).into_response());
-                    }
-                }
-            }
+        if let Some(content_length) = parts.headers.get("content-length")
+            && let Ok(length_str) = content_length.to_str()
+            && let Ok(length) = length_str.parse::<usize>()
+            && length > MAX_CONTENT_LENGTH
+        {
+            let error_msg = format!(
+                "Content-Length {length} exceeds maximum allowed size {MAX_CONTENT_LENGTH}"
+            );
+            error!("{}", error_msg);
+            return Ok((StatusCode::PAYLOAD_TOO_LARGE, error_msg).into_response());
         }
 
         // deserialize trace stats from the request body, convert to protobuf structs (see
         // trace-protobuf crate)
         let mut stats: pb::ClientStatsPayload =
-            match stats_utils::get_stats_from_request_body(hyper_migration::Body::from_bytes(body))
+            match stats_utils::get_stats_from_request_body(http_common::Body::from_bytes(body))
                 .await
             {
                 Ok(result) => result,
