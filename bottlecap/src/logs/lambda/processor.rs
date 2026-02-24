@@ -477,18 +477,16 @@ impl LambdaProcessor {
         let should_send_log = self.logs_enabled
             && LambdaProcessor::apply_rules(&self.rules, &mut log.message.message);
 
+        if !should_send_log {
+            return;
+        }
+
         // Policy evaluation - check if the log should be kept
         if let Some(evaluator) = &self.policy_evaluator {
             if !evaluator.should_keep_sync(&log) {
                 debug!("LOGS | Dropping log due to policy");
                 return;
             }
-        }
-        if should_send_log && let Ok(serialized_log) = serde_json::to_string(&log) {
-            // explicitly drop log so we don't accidentally re-use it and push
-            // duplicate logs to the aggregator
-            drop(log);
-            self.ready_logs.push(serialized_log);
         }
 
         if let Ok(serialized_log) = serde_json::to_string(&log) {
@@ -1754,7 +1752,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(2);
         let mut processor =
-            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false);
+            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false, None);
 
         // Set request_id so logs are not orphaned
         let start_event = TelemetryEvent {
@@ -1839,7 +1837,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(2);
         let mut processor =
-            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false);
+            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false, None);
 
         // Set request_id
         let start_event = TelemetryEvent {
@@ -1880,7 +1878,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(2);
         let mut processor =
-            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false);
+            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false, None);
 
         // Set request_id
         let start_event = TelemetryEvent {
@@ -1921,7 +1919,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(2);
         let mut processor =
-            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false);
+            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false, None);
 
         // PlatformRuntimeDone with timeout should keep "error" status
         let event = TelemetryEvent {
@@ -1961,7 +1959,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(2);
         let mut processor =
-            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), true);
+            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), true, None);
 
         // Extension log from our JSON formatter: {"level":"ERROR","message":"DD_EXTENSION | ERROR | ..."}
         // Arrives as a string since it was written to stderr as a JSON line
@@ -2011,7 +2009,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(2);
         let mut processor =
-            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false);
+            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false, None);
 
         // Set request_id
         let start_event = TelemetryEvent {
@@ -2074,7 +2072,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(2);
         let mut processor =
-            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false);
+            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false, None);
 
         // Set request_id
         let start_event = TelemetryEvent {
@@ -2123,7 +2121,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(2);
         let mut processor =
-            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false);
+            LambdaProcessor::new(tags_provider, Arc::clone(&config), tx.clone(), false, None);
 
         // Set request_id
         let start_event = TelemetryEvent {
@@ -2157,5 +2155,167 @@ mod tests {
         let lambda_message = processor.get_message(event).await.unwrap();
         let intake_log = processor.get_intake_log(lambda_message).unwrap();
         assert_eq!(intake_log.message.status, "warn");
+    }
+
+    #[tokio::test]
+    async fn test_process_policy_drops_log() {
+        use policy_rs::proto::tero::policy::v1::{
+            LogField, LogMatcher, LogTarget, Policy as ProtoPolicy, log_matcher,
+        };
+        use policy_rs::{Policy, PolicyRegistry};
+
+        let config = Arc::new(config::Config {
+            service: Some("test-service".to_string()),
+            tags: HashMap::from([("test".to_string(), "tags".to_string())]),
+            ..config::Config::default()
+        });
+
+        let tags_provider = Arc::new(provider::Provider::new(
+            Arc::clone(&config),
+            LAMBDA_RUNTIME_SLUG.to_string(),
+            &HashMap::from([("function_arn".to_string(), "test-arn".to_string())]),
+        ));
+
+        // Create a drop policy that matches the START log
+        let matcher = LogMatcher {
+            field: Some(log_matcher::Field::LogField(LogField::Body.into())),
+            r#match: Some(log_matcher::Match::Regex("START".to_string())),
+            negate: false,
+            case_insensitive: false,
+        };
+        let log_target = LogTarget {
+            r#match: vec![matcher],
+            keep: "none".to_string(),
+            transform: None,
+            sample_key: None,
+        };
+        let proto = ProtoPolicy {
+            id: "drop-all".to_string(),
+            name: "drop-all".to_string(),
+            enabled: true,
+            target: Some(policy_rs::proto::tero::policy::v1::policy::Target::Log(
+                log_target,
+            )),
+            ..Default::default()
+        };
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+        handle.update(vec![Policy::new(proto)]);
+        let evaluator = Arc::new(PolicyEvaluator::new(registry));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+        let (aggregator_service, aggregator_handle) = AggregatorService::default();
+        let service_handle = tokio::spawn(async move {
+            aggregator_service.run().await;
+        });
+
+        let mut processor = LambdaProcessor::new(
+            Arc::clone(&tags_provider),
+            Arc::clone(&config),
+            tx.clone(),
+            false,
+            Some(evaluator),
+        );
+
+        let event = TelemetryEvent {
+            time: Utc.with_ymd_and_hms(2023, 1, 7, 3, 23, 47).unwrap(),
+            record: TelemetryRecord::PlatformStart {
+                request_id: "test-request-id".to_string(),
+                version: Some("test".to_string()),
+            },
+        };
+
+        processor.process(event, &aggregator_handle).await;
+
+        let batches = aggregator_handle.get_batches().await.unwrap();
+        assert!(batches.is_empty(), "Policy should have dropped the log");
+
+        aggregator_handle
+            .shutdown()
+            .expect("Failed to shutdown aggregator service");
+        service_handle
+            .await
+            .expect("Aggregator service task failed");
+    }
+
+    #[tokio::test]
+    async fn test_process_policy_keeps_log() {
+        use policy_rs::proto::tero::policy::v1::{
+            LogField, LogMatcher, LogTarget, Policy as ProtoPolicy, log_matcher,
+        };
+        use policy_rs::{Policy, PolicyRegistry};
+
+        let config = Arc::new(config::Config {
+            service: Some("test-service".to_string()),
+            tags: HashMap::from([("test".to_string(), "tags".to_string())]),
+            ..config::Config::default()
+        });
+
+        let tags_provider = Arc::new(provider::Provider::new(
+            Arc::clone(&config),
+            LAMBDA_RUNTIME_SLUG.to_string(),
+            &HashMap::from([("function_arn".to_string(), "test-arn".to_string())]),
+        ));
+
+        // Create a keep policy that matches the START log
+        let matcher = LogMatcher {
+            field: Some(log_matcher::Field::LogField(LogField::Body.into())),
+            r#match: Some(log_matcher::Match::Regex("START".to_string())),
+            negate: false,
+            case_insensitive: false,
+        };
+        let log_target = LogTarget {
+            r#match: vec![matcher],
+            keep: "keep".to_string(),
+            transform: None,
+            sample_key: None,
+        };
+        let proto = ProtoPolicy {
+            id: "keep-all".to_string(),
+            name: "keep-all".to_string(),
+            enabled: true,
+            target: Some(policy_rs::proto::tero::policy::v1::policy::Target::Log(
+                log_target,
+            )),
+            ..Default::default()
+        };
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+        handle.update(vec![Policy::new(proto)]);
+        let evaluator = Arc::new(PolicyEvaluator::new(registry));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(2);
+        let (aggregator_service, aggregator_handle) = AggregatorService::default();
+        let service_handle = tokio::spawn(async move {
+            aggregator_service.run().await;
+        });
+
+        let mut processor = LambdaProcessor::new(
+            Arc::clone(&tags_provider),
+            Arc::clone(&config),
+            tx.clone(),
+            false,
+            Some(evaluator),
+        );
+
+        let event = TelemetryEvent {
+            time: Utc.with_ymd_and_hms(2023, 1, 7, 3, 23, 47).unwrap(),
+            record: TelemetryRecord::PlatformStart {
+                request_id: "test-request-id".to_string(),
+                version: Some("test".to_string()),
+            },
+        };
+
+        processor.process(event, &aggregator_handle).await;
+
+        let batches = aggregator_handle.get_batches().await.unwrap();
+        assert_eq!(batches.len(), 1, "Policy should have kept the log");
+
+        aggregator_handle
+            .shutdown()
+            .expect("Failed to shutdown aggregator service");
+        service_handle
+            .await
+            .expect("Aggregator service task failed");
     }
 }

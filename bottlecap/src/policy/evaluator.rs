@@ -1985,6 +1985,51 @@ mod tests {
         assert!(evaluator.should_keep(&log).await);
     }
 
+    // ==================== Sync Drop/Keep/Sample Tests ====================
+
+    #[test]
+    fn test_sync_drop_policy() {
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+
+        let policy = body_regex_policy("drop-test", "Test log", "none", true);
+        handle.update(vec![policy]);
+
+        let evaluator = PolicyEvaluator::new(registry);
+        let log = default_test_log();
+
+        assert!(!evaluator.should_keep_sync(&log));
+    }
+
+    #[test]
+    fn test_sync_keep_policy() {
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+
+        let policy = body_regex_policy("keep-test", "Test log", "keep", true);
+        handle.update(vec![policy]);
+
+        let evaluator = PolicyEvaluator::new(registry);
+        let log = default_test_log();
+
+        assert!(evaluator.should_keep_sync(&log));
+    }
+
+    #[test]
+    fn test_sync_no_match_keeps() {
+        let registry = Arc::new(PolicyRegistry::new());
+        let handle = registry.register_provider();
+
+        let policy = body_regex_policy("drop-other", "no_match_here", "none", true);
+        handle.update(vec![policy]);
+
+        let evaluator = PolicyEvaluator::new(registry);
+        let log = default_test_log();
+
+        // No match means keep
+        assert!(evaluator.should_keep_sync(&log));
+    }
+
     // ==================== Sync vs Async Consistency ====================
 
     #[tokio::test]
