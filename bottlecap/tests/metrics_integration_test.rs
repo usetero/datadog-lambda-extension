@@ -1,6 +1,6 @@
 use bottlecap::config::Config;
 use bottlecap::metrics::enhanced::lambda::Lambda as enhanced_metrics;
-use dogstatsd::aggregator_service::AggregatorService;
+use dogstatsd::aggregator::AggregatorService;
 use dogstatsd::api_key::ApiKeyFactory;
 use dogstatsd::datadog::{DdDdUrl, MetricsIntakeUrlPrefix, MetricsIntakeUrlPrefixOverride};
 use dogstatsd::flusher::Flusher as MetricsFlusher;
@@ -9,14 +9,12 @@ use dogstatsd::metric::SortedTags;
 use httpmock::prelude::*;
 use std::sync::Arc;
 
-mod common;
-
 #[tokio::test]
 async fn test_enhanced_metrics() {
     let dd_api_key = "my_test_key";
 
     // payload looks like
-    // aws.lambda.enhanced.invocations"_dd.compute_stats:1"architecture:x86_64"function_arn:test-arn:�൴      �?!      �?)      �?1      �?:�B
+    // aws.lambda.enhanced.invocations"architecture:x86_64"function_arn:test-arn:�൴      �?!      �?)      �?1      �?:�B
     // protobuf is using hashmap, can't set a btreemap to have sorted keys. Using multiple regexp since
     // Can't do look around since -> error: look-around, including look-ahead and look-behind, is not supported
     let regexp_metric_name = r#"aws.lambda.enhanced.invocations"#;
@@ -51,9 +49,10 @@ async fn test_enhanced_metrics() {
         aggregator_handle: metrics_aggr_handle.clone(),
         metrics_intake_url_prefix: MetricsIntakeUrlPrefix::new(None, Some(metrics_site_override))
             .expect("can't parse metrics intake URL from site"),
-        https_proxy: None,
-        ca_cert_path: None,
-        timeout: std::time::Duration::from_secs(5),
+        client: datadog_fips::reqwest_adapter::create_reqwest_client_builder()
+            .expect("failed to create client builder")
+            .build()
+            .expect("failed to build client"),
         retry_strategy: dogstatsd::datadog::RetryStrategy::Immediate(1),
         compression_level: 6,
     };

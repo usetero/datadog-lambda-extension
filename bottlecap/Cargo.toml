@@ -12,6 +12,7 @@ chrono = { version = "0.4", features = ["serde", "std", "now"], default-features
 cookie = { version = "0.18", default-features = false }
 figment = { version = "0.10", default-features = false, features = ["yaml", "env"] }
 fnv = { version = "1.0", default-features = false }
+http = { version = "1" }
 hyper = { version = "1.6", default-features = false, features = ["server"] }
 hyper-util = { version = "0.1.16", features = ["http1", "client", "client-legacy"] }
 http-body = { version = "1", default-features = false }
@@ -35,25 +36,31 @@ tokio = { version = "1.47", default-features = false, features = ["macros", "rt-
 tokio-util = { version = "0.7", default-features = false }
 tracing = { version = "0.1", default-features = false }
 tracing-core = { version = "0.1", default-features = false }
-tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry", "fmt", "env-filter", "tracing-log", "json"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry", "fmt", "env-filter", "tracing-log"] }
 hmac = { version = "0.12", default-features = false }
 sha2 = { version = "0.10", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["std"] }
 base64 = { version = "0.22", default-features = false }
-rustls = { version = "0.23.18", default-features = false, features = ["aws-lc-rs"] }
+rustls = { version = "0.23.18", default-features = false }
+# Transitive via rustls. Pinned to >=0.103.13 so cargo audit passes (RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104).
+rustls-webpki = { version = "0.103.13", default-features = false }
 rustls-pemfile = { version = "2.0", default-features = false, features = ["std"] }
 rustls-pki-types = { version = "1.0", default-features = false }
 hyper-rustls = { version = "0.27.7", default-features = false }
 rand = { version = "0.8", default-features = false }
-prost = { version = "0.13", default-features = false }
-tonic-types = { version = "0.12", default-features = false }
+prost = { version = "0.14", default-features = false }
+tonic = { version = "0.14", features = ["transport", "codegen", "server", "channel", "router"], default-features = false }
+tonic-types = { version = "0.14", default-features = false }
 zstd = { version = "0.13.3", default-features = false }
 futures = { version = "0.3.31", default-features = false }
 serde-aux = { version = "4.7", default-features = false }
 serde_html_form = { version = "0.2", default-features = false }
-opentelemetry-proto = { version = "0.29", features = ["trace", "with-serde", "gen-tonic"] }
+opentelemetry-proto = { version = "0.31.0", features = ["trace", "with-serde", "gen-tonic"] }
 opentelemetry-semantic-conventions = { version = "0.30", features = ["semconv_experimental"] }
-rustls-native-certs = { version = "0.8.1", optional = true }
+# Pinned to <0.8.3: version 0.8.3 upgraded to openssl-probe 0.2.x which scans all cert
+# directories and parses ~200 individual cert files on Lambda instead of loading a single
+# bundle file, adding ~45ms to each reqwest::Client::build() call.
+rustls-native-certs = { version = ">=0.8.1, <0.8.3", optional = true }
 axum = { version = "0.8.4", default-features = false, features = ["default"] }
 ustr = { version = "1.0.0", default-features = false }
 tower-http = { version = "0.6.6", default-features = false, features = ["limit"] }
@@ -68,23 +75,34 @@ indexmap = {version = "2.11.0", default-features = false}
 # be found in the clippy.toml file adjacent to this Cargo.toml.
 datadog-protos = { version = "0.1.0", default-features = false, git = "https://github.com/DataDog/saluki/", rev = "f863626dbfe3c59bb390985fa6530b0621c2a0a2"}
 ddsketch-agent = { version = "0.1.0", default-features = false, git = "https://github.com/DataDog/saluki/", rev = "f863626dbfe3c59bb390985fa6530b0621c2a0a2"}
-libdd-common = { git = "https://github.com/DataDog/libdatadog", rev = "c8121f422d2c8d219f8d421ff3cdb1fcbe9e8b09" }
-libdd-trace-protobuf = { git = "https://github.com/DataDog/libdatadog", rev = "c8121f422d2c8d219f8d421ff3cdb1fcbe9e8b09"  }
-libdd-trace-utils = { git = "https://github.com/DataDog/libdatadog", rev = "c8121f422d2c8d219f8d421ff3cdb1fcbe9e8b09" , features = ["mini_agent"] }
-libdd-trace-normalization = { git = "https://github.com/DataDog/libdatadog",  rev = "c8121f422d2c8d219f8d421ff3cdb1fcbe9e8b09" }
-libdd-trace-obfuscation = { git = "https://github.com/DataDog/libdatadog", rev = "c8121f422d2c8d219f8d421ff3cdb1fcbe9e8b09"  }
-libdd-trace-stats = { git = "https://github.com/DataDog/libdatadog", rev = "c8121f422d2c8d219f8d421ff3cdb1fcbe9e8b09"  }
-dogstatsd = { git = "https://github.com/DataDog/serverless-components", rev = "2eb009a59ed07ffcaf174db1c31af413365e9bc6", default-features = false }
-datadog-fips = { git = "https://github.com/DataDog/serverless-components", rev = "2eb009a59ed07ffcaf174db1c31af413365e9bc6", default-features = false }
+libdd-capabilities = { git = "https://github.com/DataDog/libdatadog", rev = "48da0d82cb32b43d4cdece35b794c9bcbc275a03" }
+libdd-common = { git = "https://github.com/DataDog/libdatadog", rev = "48da0d82cb32b43d4cdece35b794c9bcbc275a03", default-features = false }
+libdd-trace-protobuf = { git = "https://github.com/DataDog/libdatadog", rev = "48da0d82cb32b43d4cdece35b794c9bcbc275a03" }
+libdd-trace-utils = { git = "https://github.com/DataDog/libdatadog", rev = "48da0d82cb32b43d4cdece35b794c9bcbc275a03", default-features = false, features = ["mini_agent"] }
+libdd-trace-normalization = { git = "https://github.com/DataDog/libdatadog", rev = "48da0d82cb32b43d4cdece35b794c9bcbc275a03" }
+libdd-trace-obfuscation = { git = "https://github.com/DataDog/libdatadog", rev = "48da0d82cb32b43d4cdece35b794c9bcbc275a03", default-features = false }
+libdd-trace-stats = { git = "https://github.com/DataDog/libdatadog", rev = "48da0d82cb32b43d4cdece35b794c9bcbc275a03", default-features = false }
+datadog-opentelemetry = { git = "https://github.com/DataDog/dd-trace-rs", rev = "f51cefc4ad24bec81b38fb2f36b1ed93f21ae913", default-features = false }
+dogstatsd = { git = "https://github.com/DataDog/serverless-components", rev = "8ce37eb029410b7cf30847376772e3af6baa5f5c", default-features = false }
+datadog-fips = { git = "https://github.com/DataDog/serverless-components", rev = "8ce37eb029410b7cf30847376772e3af6baa5f5c", default-features = false }
+datadog-agent-config = { git = "https://github.com/DataDog/serverless-components", rev = "8ce37eb029410b7cf30847376772e3af6baa5f5c", default-features = false }
 libddwaf = { version = "1.28.1", git = "https://github.com/DataDog/libddwaf-rust", rev = "d1534a158d976bd4f747bf9fcc58e0712d2d17fc", default-features = false, features = ["serde"] }
 
 [dev-dependencies]
 figment = { version = "0.10", default-features = false, features = ["yaml", "env", "test"] }
 proptest = "1.4"
 httpmock = "0.7"
+tower = { version = "0.5", features = ["util"] }
 mock_instant = "0.6"
 serial_test = "3.1"
 tempfile = "3.20"
+# Local TLS server for the http.rs root-trust tests (H1: webpki default +
+# tls_cert_file mitigation). Already present transitively via reqwest's
+# hyper-rustls, so promoting it to a dev-dep adds nothing to the shipped binary.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+# fake-intake test harness: decode msgpack+gzip stats payloads on arrival
+rmp-serde = { version = "1.3.1", default-features = false }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 
 [build-dependencies]
 # No external dependencies needed for the build script
@@ -115,11 +133,34 @@ opt-level = 3
 tikv-jemallocator = "0.5"
 
 [features]
-default = ["reqwest/rustls-tls-native-roots", "dogstatsd/default", "datadog-fips/default" ]
+default = [
+    # Use webpki-roots (compiled-in Mozilla CA bundle) rather than
+    # rustls-tls-native-roots for the non-FIPS reqwest clients. native-roots
+    # calls rustls_native_certs::load_native_certs() — a filesystem cert-bundle
+    # scan/parse — on *every* reqwest::Client::build(), and bottlecap builds
+    # three reqwest clients during cold-start init (the register client in
+    # bin/bottlecap/main.rs, the shared flush client in src/http.rs, and the
+    # secrets-decrypt client in src/secrets/decrypt.rs for KMS/SM/SSM/STS).
+    # webpki-roots removes that per-build scan. Trade-off: webpki trusts only the
+    # public Mozilla roots, so private/internal OS-installed CAs are no longer
+    # picked up implicitly; users relying on those must point DD_PROXY_HTTPS at a
+    # trusted intercept or supply the CA via tls_cert_file (which still layers on
+    # top via add_root_certificate in src/http.rs). FIPS builds keep native-roots
+    # (see the `fips` feature) and are unaffected.
+    "reqwest/rustls-tls-webpki-roots",
+    "datadog-fips/default",
+    "datadog-agent-config/https",
+    "libdd-common/https",
+    "libdd-trace-utils/https",
+    "libdd-trace-obfuscation/https",
+    "libdd-trace-stats/https",
+]
 fips = [
+    "datadog-agent-config/fips",
     "libdd-common/fips",
     "libdd-trace-utils/fips",
-    "dogstatsd/fips",
+    "libdd-trace-obfuscation/fips",
+    "libdd-trace-stats/fips",
     "datadog-fips/fips",
     "libddwaf/fips",
     "reqwest/rustls-tls-native-roots-no-provider",

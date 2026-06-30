@@ -51,6 +51,7 @@ use bottlecap::{
             AggregatorHandle as LogsAggregatorHandle, AggregatorService as LogsAggregatorService,
         },
         flusher::LogsFlusher,
+        lambda::DurableContextUpdate,
     },
     otlp::{agent::Agent as OtlpAgent, should_enable_otlp_agent},
     policy::PolicyEvaluator,
@@ -61,6 +62,7 @@ use bottlecap::{
         provider::Provider as TagProvider,
     },
     traces::{
+        http_client as trace_http_client,
         propagation::DatadogCompositePropagator,
         proxy_aggregator,
         proxy_flusher::Flusher as ProxyFlusher,
@@ -81,8 +83,9 @@ use bottlecap::{
 use datadog_fips::reqwest_adapter::create_reqwest_client_builder;
 use decrypt::resolve_secrets;
 use dogstatsd::{
-    aggregator_service::AggregatorHandle as MetricsAggregatorHandle,
-    aggregator_service::AggregatorService as MetricsAggregatorService,
+    aggregator::{
+        AggregatorHandle as MetricsAggregatorHandle, AggregatorService as MetricsAggregatorService,
+    },
     api_key::ApiKeyFactory,
     constants::CONTEXTS,
     datadog::{
@@ -101,7 +104,7 @@ use policy_rs::{
 };
 use reqwest::Client;
 use std::{collections::hash_map, env, path::Path, str::FromStr, sync::Arc};
-use tokio::time::{Duration, Instant};
+use tokio::time::Instant;
 use tokio::{sync::Mutex as TokioMutex, sync::mpsc::Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -153,7 +156,11 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config::get_config(Path::new(&lambda_directory)));
 
     let aws_config = Arc::new(aws_config);
-    let api_key_factory = create_api_key_factory(&config, &aws_config);
+    // Build one shared reqwest::Client for metrics, logs, trace proxy flushing, and calls to
+    // Datadog APIs (e.g. delegated auth). reqwest::Client is Arc-based internally, so cloning
+    // just increments a refcount and shares the connection pool.
+    let shared_client = bottlecap::http::get_client(&config);
+    let api_key_factory = create_api_key_factory(&config, &aws_config, &shared_client);
 
     let r = response
         .await
@@ -164,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&aws_config),
         &config,
         &client,
+        shared_client,
         &r,
         Arc::clone(&api_key_factory),
         start_time,
@@ -249,17 +257,23 @@ fn get_flush_strategy_for_mode(
     }
 }
 
-fn create_api_key_factory(config: &Arc<Config>, aws_config: &Arc<AwsConfig>) -> Arc<ApiKeyFactory> {
+fn create_api_key_factory(
+    config: &Arc<Config>,
+    aws_config: &Arc<AwsConfig>,
+    client: &reqwest::Client,
+) -> Arc<ApiKeyFactory> {
     let config = Arc::clone(config);
     let aws_config = Arc::clone(aws_config);
-    let api_key_secret_reload_interval = config.api_key_secret_reload_interval;
+    let client = client.clone();
+    let api_key_secret_reload_interval = config.ext.api_key_secret_reload_interval;
 
     Arc::new(ApiKeyFactory::new_from_resolver(
         Arc::new(move || {
             let config = Arc::clone(&config);
             let aws_config = Arc::clone(&aws_config);
+            let client = client.clone();
 
-            Box::pin(async move { resolve_secrets(config, aws_config).await })
+            Box::pin(async move { resolve_secrets(config, aws_config, client).await })
         }),
         api_key_secret_reload_interval,
     ))
@@ -288,6 +302,7 @@ async fn extension_loop_active(
     aws_config: Arc<AwsConfig>,
     config: &Arc<Config>,
     client: &Client,
+    shared_client: reqwest::Client,
     r: &RegisterResponse,
     api_key_factory: Arc<ApiKeyFactory>,
     start_time: Instant,
@@ -308,7 +323,7 @@ async fn extension_loop_active(
     let tags_provider = setup_tag_provider(&Arc::clone(&aws_config), config, &account_id);
 
     // Initialize policy evaluator if enabled
-    let policy_evaluator: Option<Arc<PolicyEvaluator>> = if config.policy_enabled {
+    let policy_evaluator: Option<Arc<PolicyEvaluator>> = if config.ext.policy_enabled {
         let registry = Arc::new(PolicyRegistry::new());
 
         // Build function ARN for resource attributes
@@ -350,7 +365,7 @@ async fn extension_loop_active(
         };
 
         // Register all configured providers
-        if let Some(providers) = &config.policy_providers {
+        if let Some(providers) = &config.ext.policy_providers {
             for provider_config in providers {
                 match provider_config {
                     bottlecap::config::policy_provider::PolicyProviderConfig::Http {
@@ -360,7 +375,7 @@ async fn extension_loop_active(
                         poll_interval_secs,
                     } => {
                         let mut http_config = HttpProviderConfig::new(url)
-                            .poll_interval(Duration::from_secs(*poll_interval_secs))
+                            .poll_interval(std::time::Duration::from_secs(*poll_interval_secs))
                             .content_type(ContentType::Json)
                             .client_metadata(client_metadata.clone());
 
@@ -408,18 +423,29 @@ async fn extension_loop_active(
         None
     };
 
-    let (logs_agent_channel, logs_flusher, logs_agent_cancel_token, logs_aggregator_handle) =
-        start_logs_agent(
-            config,
-            Arc::clone(&api_key_factory),
-            &tags_provider,
-            event_bus_tx.clone(),
-            aws_config.is_managed_instance_mode(),
-            policy_evaluator.clone(),
-        );
+    let (
+        logs_agent_channel,
+        logs_flusher,
+        logs_agent_cancel_token,
+        logs_aggregator_handle,
+        durable_context_tx,
+    ) = start_logs_agent(
+        config,
+        Arc::clone(&api_key_factory),
+        &tags_provider,
+        event_bus_tx.clone(),
+        aws_config.is_managed_instance_mode(),
+        policy_evaluator.clone(),
+        &shared_client,
+    );
 
-    let (metrics_flushers, metrics_aggregator_handle, dogstatsd_cancel_token) =
-        start_dogstatsd(tags_provider.clone(), Arc::clone(&api_key_factory), config).await;
+    let (metrics_flushers, metrics_aggregator_handle, dogstatsd_cancel_token) = start_dogstatsd(
+        tags_provider.clone(),
+        Arc::clone(&api_key_factory),
+        config,
+        &shared_client,
+    )
+    .await;
 
     let propagator = Arc::new(DatadogCompositePropagator::new(Arc::clone(config)));
     // Lifecycle Invocation Processor
@@ -430,6 +456,7 @@ async fn extension_loop_active(
             Arc::clone(&aws_config),
             metrics_aggregator_handle.clone(),
             Arc::clone(&propagator),
+            durable_context_tx,
         );
     tokio::spawn(async move {
         invocation_processor_service.run().await;
@@ -462,6 +489,7 @@ async fn extension_loop_active(
         &tags_provider,
         invocation_processor_handle.clone(),
         appsec_processor.clone(),
+        &shared_client,
     );
 
     let api_runtime_proxy_shutdown_signal = start_api_runtime_proxy(
@@ -488,7 +516,7 @@ async fn extension_loop_active(
         &aws_config.runtime_api,
         logs_agent_channel,
         event_bus_tx.clone(),
-        config.serverless_logs_enabled,
+        config.ext.serverless_logs_enabled,
         aws_config.is_managed_instance_mode(),
     )
     .await?;
@@ -502,7 +530,8 @@ async fn extension_loop_active(
     );
 
     // Validate and get the appropriate flush strategy for the current mode
-    let flush_strategy = get_flush_strategy_for_mode(&aws_config, config.serverless_flush_strategy);
+    let flush_strategy =
+        get_flush_strategy_for_mode(&aws_config, config.ext.serverless_flush_strategy);
     debug!("Flush strategy: {:?}", flush_strategy);
     let mut flush_control = FlushControl::new(flush_strategy, config.flush_timeout);
 
@@ -931,9 +960,12 @@ async fn handle_event_bus_event(
     stats_concentrator: StatsConcentratorHandle,
 ) -> Option<TelemetryEvent> {
     match event {
-        Event::OutOfMemory(event_timestamp) => {
+        Event::OutOfMemory {
+            request_id,
+            timestamp,
+        } => {
             if let Err(e) = invocation_processor_handle
-                .on_out_of_memory_error(event_timestamp)
+                .on_out_of_memory_error(request_id, timestamp)
                 .await
             {
                 error!("Failed to send out of memory error to processor: {}", e);
@@ -942,9 +974,11 @@ async fn handle_event_bus_event(
         Event::Telemetry(event) => {
             debug!("Telemetry event received: {:?}", event);
             match event.record {
-                TelemetryRecord::PlatformInitStart { .. } => {
+                TelemetryRecord::PlatformInitStart {
+                    runtime_version, ..
+                } => {
                     if let Err(e) = invocation_processor_handle
-                        .on_platform_init_start(event.time)
+                        .on_platform_init_start(event.time, runtime_version)
                         .await
                     {
                         error!("Failed to send platform init start to processor: {}", e);
@@ -1136,11 +1170,13 @@ fn start_logs_agent(
     event_bus: Sender<Event>,
     is_managed_instance_mode: bool,
     policy_evaluator: Option<Arc<PolicyEvaluator>>,
+    client: &Client,
 ) -> (
     Sender<TelemetryEvent>,
     LogsFlusher,
     CancellationToken,
     LogsAggregatorHandle,
+    Sender<DurableContextUpdate>,
 ) {
     let (aggregator_service, aggregator_handle) = LogsAggregatorService::default();
     // Start service in background
@@ -1148,7 +1184,7 @@ fn start_logs_agent(
         aggregator_service.run().await;
     });
 
-    let (mut agent, tx) = LogsAgent::new(
+    let (mut agent, tx, durable_context_tx) = LogsAgent::new(
         Arc::clone(tags_provider),
         Arc::clone(config),
         event_bus,
@@ -1165,8 +1201,19 @@ fn start_logs_agent(
         drop(agent);
     });
 
-    let flusher = LogsFlusher::new(api_key_factory, aggregator_handle.clone(), config.clone());
-    (tx, flusher, cancel_token, aggregator_handle)
+    let flusher = LogsFlusher::new(
+        api_key_factory,
+        aggregator_handle.clone(),
+        config.clone(),
+        client.clone(),
+    );
+    (
+        tx,
+        flusher,
+        cancel_token,
+        aggregator_handle,
+        durable_context_tx,
+    )
 }
 
 #[allow(clippy::type_complexity)]
@@ -1176,6 +1223,7 @@ fn start_trace_agent(
     tags_provider: &Arc<TagProvider>,
     invocation_processor_handle: InvocationProcessorHandle,
     appsec_processor: Option<Arc<TokioMutex<AppSecProcessor>>>,
+    client: &Client,
 ) -> (
     Sender<SendDataBuilderInfo>,
     Arc<trace_flusher::TraceFlusher>,
@@ -1186,6 +1234,15 @@ fn start_trace_agent(
     StatsConcentratorHandle,
     TraceAggregatorHandle,
 ) {
+    // Build one shared hyper-based HTTP client for trace and stats flushing.
+    // This client type is required by libdd_trace_utils for SendData::send().
+    let trace_http_client = trace_http_client::create_client(
+        config.proxy_https.as_ref(),
+        config.tls_cert_file.as_ref(),
+        config.skip_ssl_validation,
+    )
+    .expect("Failed to create trace HTTP client");
+
     // Stats
     let (stats_concentrator_service, stats_concentrator_handle) =
         StatsConcentratorService::new(Arc::clone(config));
@@ -1197,6 +1254,8 @@ fn start_trace_agent(
         api_key_factory.clone(),
         stats_aggregator.clone(),
         Arc::clone(config),
+        trace_http_client.clone(),
+        libdd_trace_utils::config_utils::trace_stats_url(&config.site),
     ));
 
     let stats_processor = Arc::new(stats_processor::ServerlessStatsProcessor {});
@@ -1209,15 +1268,16 @@ fn start_trace_agent(
         trace_aggregator_handle.clone(),
         config.clone(),
         api_key_factory.clone(),
+        trace_http_client,
     ));
 
     let obfuscation_config = obfuscation_config::ObfuscationConfig {
         tag_replace_rules: config.apm_replace_tags.clone(),
-        http_remove_path_digits: config.apm_config_obfuscation_http_remove_paths_with_digits,
-        http_remove_query_string: config.apm_config_obfuscation_http_remove_query_string,
-        obfuscate_memcached: false,
-        obfuscation_redis_enabled: false,
-        obfuscation_redis_remove_all_args: false,
+        http: obfuscation_config::HttpConfig {
+            remove_paths_with_digits: config.apm_config_obfuscation_http_remove_paths_with_digits,
+            remove_query_string: config.apm_config_obfuscation_http_remove_query_string,
+        },
+        ..Default::default()
     };
 
     let trace_processor = Arc::new(trace_processor::ServerlessTraceProcessor {
@@ -1234,6 +1294,7 @@ fn start_trace_agent(
         Arc::clone(&proxy_aggregator),
         Arc::clone(tags_provider),
         Arc::clone(config),
+        client.clone(),
     ));
 
     let trace_agent = trace_agent::TraceAgent::new(
@@ -1274,6 +1335,7 @@ async fn start_dogstatsd(
     tags_provider: Arc<TagProvider>,
     api_key_factory: Arc<ApiKeyFactory>,
     config: &Arc<Config>,
+    client: &Client,
 ) -> (
     Arc<Vec<MetricsFlusher>>,
     MetricsAggregatorHandle,
@@ -1281,8 +1343,29 @@ async fn start_dogstatsd(
 ) {
     // Start aggregator service and handle
     let start_time = Instant::now();
+    let enrichment_tags = if config.ext.custom_metrics_exclude_tags.is_empty() {
+        tags_provider.get_tags_string()
+    } else {
+        debug!(
+            "Excluding tags from custom metrics: {:?}",
+            config.ext.custom_metrics_exclude_tags
+        );
+        tags_provider
+            .get_tags_vec()
+            .into_iter()
+            .filter(|tag| {
+                let key = tag.split(':').next().unwrap_or("");
+                !config
+                    .ext
+                    .custom_metrics_exclude_tags
+                    .iter()
+                    .any(|e| e == key)
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let (aggregator_service, aggregator_handle) = MetricsAggregatorService::new(
-        SortedTags::parse(&tags_provider.get_tags_string()).unwrap_or(EMPTY_TAGS),
+        SortedTags::parse(&enrichment_tags).unwrap_or(EMPTY_TAGS),
         CONTEXTS,
     )
     .expect("can't create metrics service");
@@ -1301,6 +1384,7 @@ async fn start_dogstatsd(
         Arc::clone(&api_key_factory),
         &aggregator_handle,
         config,
+        client,
     ));
 
     // Create Dogstatsd server
@@ -1332,6 +1416,7 @@ fn start_metrics_flushers(
     api_key_factory: Arc<ApiKeyFactory>,
     metrics_aggr_handle: &MetricsAggregatorHandle,
     config: &Arc<Config>,
+    client: &Client,
 ) -> Vec<MetricsFlusher> {
     let mut flushers = Vec::new();
 
@@ -1355,9 +1440,7 @@ fn start_metrics_flushers(
         api_key_factory,
         aggregator_handle: metrics_aggr_handle.clone(),
         metrics_intake_url_prefix: metrics_intake_url.expect("can't parse site or override"),
-        https_proxy: config.proxy_https.clone(),
-        ca_cert_path: config.tls_cert_file.clone(),
-        timeout: Duration::from_secs(config.flush_timeout),
+        client: client.clone(),
         retry_strategy: DsdRetryStrategy::Immediate(3),
         compression_level: config.metrics_config_compression_level,
     };
@@ -1385,9 +1468,7 @@ fn start_metrics_flushers(
                 api_key_factory: additional_api_key_factory,
                 aggregator_handle: metrics_aggr_handle.clone(),
                 metrics_intake_url_prefix: metrics_intake_url.clone(),
-                https_proxy: config.proxy_https.clone(),
-                ca_cert_path: config.tls_cert_file.clone(),
-                timeout: Duration::from_secs(config.flush_timeout),
+                client: client.clone(),
                 retry_strategy: DsdRetryStrategy::Immediate(3),
                 compression_level: config.metrics_config_compression_level,
             };
@@ -1443,15 +1524,18 @@ fn start_otlp_agent(
     if !should_enable_otlp_agent(config) {
         return None;
     }
+
     let stats_generator = Arc::new(StatsGenerator::new(stats_concentrator));
+    let cancel_token = CancellationToken::new();
+
     let agent = OtlpAgent::new(
         config.clone(),
         tags_provider,
         trace_processor,
         trace_tx,
         stats_generator,
+        cancel_token.clone(),
     );
-    let cancel_token = agent.cancel_token();
 
     tokio::spawn(async move {
         if let Err(e) = agent.start().await {

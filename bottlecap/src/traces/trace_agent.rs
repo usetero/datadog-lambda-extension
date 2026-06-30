@@ -29,7 +29,7 @@ use crate::{
     lifecycle::invocation::{
         context::ReparentingInfo, processor_service::InvocationProcessorHandle,
     },
-    tags::provider,
+    tags::{self, provider},
     traces::{
         INVOCATION_SPAN_RESOURCE,
         proxy_aggregator::{self, ProxyRequest},
@@ -458,7 +458,7 @@ impl TraceAgent {
                     V2_DEBUGGER_ENDPOINT_PATH,
                     DEBUGGER_DIAGNOSTICS_ENDPOINT_PATH,
                 ],
-                "client_drop_p0s": true,
+                "client_drop_p0s": false,
             }
         );
         (StatusCode::OK, response_json.to_string()).into_response()
@@ -479,7 +479,9 @@ impl TraceAgent {
         let (parts, body) = match extract_request_body(request).await {
             Ok(r) => r,
             Err(e) => {
-                return error_response(
+                // Using DEBUG level because this is usually the tracer connection closing mid-transfer when the
+                // sandbox freezes, which is not actionable.
+                return debug_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("TRACE_AGENT | handle_traces | Error extracting request body: {e}"),
                 );
@@ -501,7 +503,7 @@ impl TraceAgent {
             );
         }
 
-        let tracer_header_tags = (&parts.headers).into();
+        let tracer_header_tags: trace_utils::TracerHeaderTags<'_> = (&parts.headers).into();
 
         let (body_size, mut traces): (usize, Vec<Vec<pb::Span>>) = match version {
             ApiVersion::V04 => {
@@ -545,7 +547,9 @@ impl TraceAgent {
             for mut span in original_chunk {
                 // Check for duplicates
                 let key = DedupKey::new(span.trace_id, span.span_id);
-                let should_keep = match deduper.check_and_add(key, config.span_dedup_timeout).await
+                let should_keep = match deduper
+                    .check_and_add(key, config.ext.span_dedup_timeout)
+                    .await
                 {
                     Ok(should_keep) => {
                         if !should_keep {
@@ -557,7 +561,9 @@ impl TraceAgent {
                         should_keep
                     }
                     Err(e) => {
-                        warn!("Failed to check span in deduper, keeping span: {e}");
+                        // Not using warn or error level to avoid confusion for customers.
+                        // No action is needed on customer side.
+                        debug!("Failed to check span in deduper, keeping span: {e}");
                         true
                     }
                 };
@@ -586,11 +592,42 @@ impl TraceAgent {
 
                 if span.resource == INVOCATION_SPAN_RESOURCE
                     && let Err(e) = invocation_processor_handle
-                        .add_tracer_span(span.clone())
+                        .add_tracer_span(span.clone(), tracer_header_tags.client_computed_stats)
                         .await
                 {
                     error!("Failed to add tracer span to processor: {}", e);
                 }
+
+                if span.name == "aws.lambda"
+                    && let (Some(request_id), Some(execution_id), Some(execution_name)) = (
+                        span.meta.get(tags::lambda::tags::REQUEST_ID_KEY),
+                        span.meta.get(tags::lambda::tags::DURABLE_EXECUTION_ID_KEY),
+                        span.meta
+                            .get(tags::lambda::tags::DURABLE_EXECUTION_NAME_KEY),
+                    )
+                {
+                    let first_invocation = span
+                        .meta
+                        .get(tags::lambda::tags::DURABLE_FUNCTION_FIRST_INVOCATION_KEY)
+                        .map(|v| v == "true");
+                    let execution_status = span
+                        .meta
+                        .get(tags::lambda::tags::DURABLE_FUNCTION_EXECUTION_STATUS_KEY)
+                        .cloned();
+                    if let Err(e) = invocation_processor_handle
+                        .forward_durable_context(
+                            request_id.clone(),
+                            execution_id.clone(),
+                            execution_name.clone(),
+                            first_invocation,
+                            execution_status,
+                        )
+                        .await
+                    {
+                        error!("Failed to forward durable context to processor: {e}");
+                    }
+                }
+
                 handle_reparenting(&mut reparenting_info, &mut span);
 
                 // Keep the span
@@ -659,7 +696,7 @@ impl TraceAgent {
         let (parts, body) = match extract_request_body(request).await {
             Ok(r) => r,
             Err(e) => {
-                return error_response(
+                return warn_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("TRACE_AGENT | handle_proxy | Error extracting request body: {e}"),
                 );
@@ -721,7 +758,117 @@ fn error_response<E: std::fmt::Display>(status: StatusCode, error: E) -> Respons
     (status, error.to_string()).into_response()
 }
 
+/// Like [`error_response`], but logs at WARN level. Use when the failure is caused by an
+/// external event (e.g. client disconnected) rather than a bug in the extension itself.
+fn warn_response<E: std::fmt::Display>(status: StatusCode, error: E) -> Response {
+    warn!("{}", error);
+    (status, error.to_string()).into_response()
+}
+
+/// Like [`error_response`], but logs at DEBUG level. Use for expected external events
+/// (e.g. client disconnected mid-request) that are too noisy even at WARN.
+fn debug_response<E: std::fmt::Display>(status: StatusCode, error: E) -> Response {
+    debug!("{}", error);
+    (status, error.to_string()).into_response()
+}
+
 fn success_response(message: &str) -> Response {
     debug!("{}", message);
     (StatusCode::OK, json!({"rate_by_service": {}}).to_string()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Behavioral coverage for the `libdatadog` bump (`db05e1f` -> `48da0d8`), which pulls in
+    //! [`DataDog/libdatadog#2071`](https://github.com/DataDog/libdatadog/pull/2071). That PR makes
+    //! `From<&HeaderMap> for TracerHeaderTags` parse the `datadog-client-computed-stats` and
+    //! `datadog-client-computed-top-level` headers with the Go trace-agent's `isHeaderTrue` rule:
+    //! empty -> false; the false-like values `strconv.ParseBool` recognizes
+    //! (`0`, `f`, `F`, `FALSE`, `False`, `false`) -> false; every other non-empty value
+    //! (including unparseable ones like `"yes"`) -> true. These tests pin that parsing at the
+    //! `(&headers).into()` boundary `handle_traces` uses (see `trace_agent.rs:506`); on the
+    //! pre-bump rev they would fail (falsey strings used to resolve to `true`, and presence alone
+    //! set `top_level`), so they give the dep bump its missing behavioral coverage.
+    //!
+    //! The `client_computed_stats` bool pinned here is what APMSVLS-487
+    //! (`lpimentel/respect-client-computed-stats`) consumes.
+
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    use libdd_trace_utils::trace_utils::TracerHeaderTags;
+
+    /// Build a `HeaderMap` with `name: value` (or no header when `value` is `None`), convert it the
+    /// same way `handle_traces` does, and return `(client_computed_stats, client_computed_top_level)`.
+    fn parse(name: &str, value: Option<&str>) -> (bool, bool) {
+        let mut headers = HeaderMap::new();
+        if let Some(v) = value {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).expect("valid header name"),
+                HeaderValue::from_str(v).expect("valid header value"),
+            );
+        }
+        let tags: TracerHeaderTags<'_> = (&headers).into();
+        (tags.client_computed_stats, tags.client_computed_top_level)
+    }
+
+    fn parse_stats(value: Option<&str>) -> bool {
+        parse("datadog-client-computed-stats", value).0
+    }
+
+    fn parse_top_level(value: Option<&str>) -> bool {
+        parse("datadog-client-computed-top-level", value).1
+    }
+
+    #[test]
+    fn truthy_values_trigger_the_fix_on_every_runtime() {
+        // Cross-runtime header values: ".NET/Java/PHP/Python" -> "true", "JS/Ruby/C++" -> "yes",
+        // "Go" -> "t", plus a canonical "1". All non-empty/non-falsey -> the fix must trigger.
+        for value in ["true", "yes", "t", "1"] {
+            assert!(
+                parse_stats(Some(value)),
+                "expected client_computed_stats == true for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_or_empty_does_not_trigger_the_fix() {
+        assert!(!parse_stats(None), "absent header must be false");
+        assert!(!parse_stats(Some("")), "empty-present header must be false");
+    }
+
+    #[test]
+    fn falsey_strings_parse_as_false_go_agent_aligned() {
+        // Post-bump (libdatadog#2071): `client_computed_stats` follows the Go trace-agent's
+        // `isHeaderTrue`/`ParseBool` rule, so the false-like literals resolve to `false`.
+        // (Pre-bump rev db05e1f parsed these as `!value.is_empty()` -> `true`; this test would
+        // have failed there, which is exactly the behavior change the bump introduces.)
+        for value in ["false", "0", "f", "F", "FALSE", "False"] {
+            assert!(
+                !parse_stats(Some(value)),
+                "expected client_computed_stats == false for {value:?} (libdatadog#2071)"
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_no_longer_set_by_presence_alone() {
+        // libdatadog#2071 also fixes `client_computed_top_level`, which previously was `true`
+        // whenever the header was merely *present* (even empty or falsey). Now it follows the
+        // same Go-agent rule as `stats`.
+        assert!(!parse_top_level(None), "absent must be false");
+        assert!(
+            !parse_top_level(Some("")),
+            "empty-present must be false (was true pre-bump)"
+        );
+        assert!(
+            !parse_top_level(Some("false")),
+            "\"false\" must be false (was true pre-bump)"
+        );
+        for value in ["true", "yes", "t", "1"] {
+            assert!(
+                parse_top_level(Some(value)),
+                "expected client_computed_top_level == true for {value:?}"
+            );
+        }
+    }
 }

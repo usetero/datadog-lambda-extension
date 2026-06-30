@@ -180,6 +180,10 @@ mod tests {
                 lambda: Lambda {
                     arn: arn.to_string(),
                     request_id: request_id.map(String::from),
+                    durable_execution_id: None,
+                    durable_execution_name: None,
+                    first_invocation: None,
+                    durable_execution_status: None,
                 },
                 timestamp: 1_234_567_890,
                 status: status.to_string(),

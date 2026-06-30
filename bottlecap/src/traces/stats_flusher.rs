@@ -6,25 +6,26 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::OnceCell;
 
+use crate::FLUSH_RETRY_COUNT;
 use crate::config;
 use crate::lifecycle::invocation::processor::S_TO_MS;
-use crate::traces::http_client::{self, HttpClient};
+use crate::traces::http_client::HttpClient;
 use crate::traces::stats_aggregator::StatsAggregator;
+use bytes::Bytes;
 use dogstatsd::api_key::ApiKeyFactory;
+use libdd_capabilities::http::HttpClientCapability;
 use libdd_common::Endpoint;
 use libdd_trace_protobuf::pb;
-use libdd_trace_utils::{config_utils::trace_stats_url, stats_utils};
+use libdd_trace_utils::stats_utils;
 use tracing::{debug, error};
 
 pub struct StatsFlusher {
     aggregator: Arc<Mutex<StatsAggregator>>,
     config: Arc<config::Config>,
     api_key_factory: Arc<ApiKeyFactory>,
+    stats_url: String,
     endpoint: OnceCell<Endpoint>,
-    /// Cached HTTP client, lazily initialized on first use.
-    /// TODO: `StatsFlusher` and `TraceFlusher` both hit trace.agent.datadoghq.{site} and could
-    /// share a single HTTP client for better connection pooling.
-    http_client: OnceCell<HttpClient>,
+    http_client: HttpClient,
 }
 
 impl StatsFlusher {
@@ -33,13 +34,16 @@ impl StatsFlusher {
         api_key_factory: Arc<ApiKeyFactory>,
         aggregator: Arc<Mutex<StatsAggregator>>,
         config: Arc<config::Config>,
+        http_client: HttpClient,
+        stats_url: String,
     ) -> Self {
         StatsFlusher {
             aggregator,
             config,
             api_key_factory,
+            stats_url,
             endpoint: OnceCell::new(),
-            http_client: OnceCell::new(),
+            http_client,
         }
     }
 
@@ -65,9 +69,8 @@ impl StatsFlusher {
             .endpoint
             .get_or_init({
                 move || async move {
-                    let stats_url = trace_stats_url(&self.config.site);
                     Endpoint {
-                        url: hyper::Uri::from_str(&stats_url)
+                        url: hyper::Uri::from_str(&self.stats_url)
                             .expect("can't make URI from stats url, exiting"),
                         api_key: Some(api_key_clone.into()),
                         timeout_ms: self.config.flush_timeout * S_TO_MS,
@@ -93,41 +96,38 @@ impl StatsFlusher {
             }
         };
 
-        let stats_url = trace_stats_url(&self.config.site);
+        for attempt in 1..=FLUSH_RETRY_COUNT {
+            let start = std::time::Instant::now();
+            let resp = send_stats_payload(
+                &self.http_client,
+                endpoint,
+                api_key.as_str(),
+                serialized_stats_payload.clone(),
+            )
+            .await;
+            let elapsed = start.elapsed();
 
-        let start = std::time::Instant::now();
-
-        // Get or create the cached HTTP client
-        let http_client = self.get_or_init_http_client().await;
-        let Some(http_client) = http_client else {
-            error!("STATS | Failed to create HTTP client, will retry");
-            return Some(stats);
-        };
-
-        let resp = stats_utils::send_stats_payload_with_client(
-            serialized_stats_payload,
-            endpoint,
-            api_key.as_str(),
-            Some(http_client),
-        )
-        .await;
-        let elapsed = start.elapsed();
-        debug!(
-            "STATS | Stats request to {} took {} ms",
-            stats_url,
-            elapsed.as_millis()
-        );
-        match resp {
-            Ok(()) => {
-                debug!("STATS | Successfully flushed stats");
-                None
-            }
-            Err(e) => {
-                // Network/server errors are temporary - return stats for retry
-                error!("STATS | Error sending stats: {e:?}");
-                Some(stats)
+            match resp {
+                Ok(()) => {
+                    debug!(
+                        "STATS | Successfully flushed stats to {} in {} ms (attempt {attempt}/{FLUSH_RETRY_COUNT})",
+                        endpoint.url,
+                        elapsed.as_millis()
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    debug!(
+                        "STATS | Failed to send stats to {} in {} ms (attempt {attempt}/{FLUSH_RETRY_COUNT}): {e:?}",
+                        endpoint.url,
+                        elapsed.as_millis()
+                    );
+                }
             }
         }
+
+        error!("STATS | Exhausted all {FLUSH_RETRY_COUNT} attempts, returning stats for redrive");
+        Some(stats)
     }
 
     /// Flushes stats from the aggregator.
@@ -170,29 +170,50 @@ impl StatsFlusher {
             Some(all_failed)
         }
     }
-    /// Returns a reference to the cached HTTP client, initializing it if necessary.
-    ///
-    /// The client is created once and reused for all subsequent flushes,
-    /// providing connection pooling and TLS session reuse.
-    ///
-    /// Returns `None` if client creation fails. The error is logged but not cached,
-    /// allowing retry on subsequent calls.
-    async fn get_or_init_http_client(&self) -> Option<&HttpClient> {
-        match self
-            .http_client
-            .get_or_try_init(|| async {
-                http_client::create_client(
-                    self.config.proxy_https.as_ref(),
-                    self.config.tls_cert_file.as_ref(),
-                )
-            })
-            .await
-        {
-            Ok(client) => Some(client),
-            Err(e) => {
-                error!("STATS_FLUSHER | Failed to create HTTP client: {e}");
-                None
-            }
-        }
+}
+
+/// Maximum number of body bytes to surface in error messages.
+const ERROR_BODY_PREVIEW_BYTES: usize = 512;
+
+/// Posts a serialized stats payload using the supplied client.
+///
+/// Equivalent to libdatadog's `stats_utils::send_stats_payload`, but uses the
+/// caller-provided client so bottlecap's proxy/TLS configuration is preserved,
+/// and enforces `target.timeout_ms` on each attempt so the surrounding retry
+/// loop stays bounded by configuration.
+async fn send_stats_payload(
+    client: &HttpClient,
+    target: &Endpoint,
+    api_key: &str,
+    data: Vec<u8>,
+) -> anyhow::Result<()> {
+    let req = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(target.url.clone())
+        .header("Content-Type", "application/msgpack")
+        .header("Content-Encoding", "gzip")
+        .header("DD-API-KEY", api_key)
+        .body(Bytes::from(data))?;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(target.timeout_ms),
+        client.request(req),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Stats request timed out after {} ms", target.timeout_ms))?
+    .map_err(|e| anyhow::anyhow!("Failed to send trace stats: {e}"))?;
+
+    let status = response.status();
+    if status != http::StatusCode::ACCEPTED {
+        let body = response.into_body();
+        let preview_len = body.len().min(ERROR_BODY_PREVIEW_BYTES);
+        let preview = String::from_utf8_lossy(&body[..preview_len]);
+        let truncated = if body.len() > preview_len {
+            " (truncated)"
+        } else {
+            ""
+        };
+        anyhow::bail!("Server did not accept trace stats (status {status}): {preview}{truncated}");
     }
+    Ok(())
 }
