@@ -9,8 +9,6 @@ use httpmock::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-mod common;
-
 #[tokio::test]
 async fn test_logs() {
     let arch = match std::env::consts::ARCH {
@@ -22,7 +20,9 @@ async fn test_logs() {
     // protobuf is using hashmap, can't set a btreemap to have sorted keys. Using multiple regexp since
     // Can't do look around since -> error: look-around, including look-ahead and look-behind, is not supported
     let regexp_message = r#"[{"message":{"message":"START RequestId: 459921b5-681c-4a96-beb0-81e0aa586026 Version: $LATEST","lambda":{"arn":"test-arn","request_id":"459921b5-681c-4a96-beb0-81e0aa586026"},"timestamp":1666361103165,"status":"info"},"hostname":"test-arn","service":"","#;
-    let regexp_compute_state = r#"_dd.compute_stats:1"#;
+    // NOTE: `_dd.compute_stats` is intentionally NOT asserted here. It is a per-span backend
+    // directive stamped on trace spans by the trace processor, not a log/function tag, so it
+    // must not appear in `ddtags` (APMSVLS-487).
     let regexp_arch = format!(r#"architecture:{}"#, arch);
     let regexp_function_arn = r#"function_arn:test-arn"#;
     let regexp_extension_version = r#"dd_extension_version"#;
@@ -34,7 +34,6 @@ async fn test_logs() {
             .header("DD-API-KEY", dd_api_key)
             .header("Content-Type", "application/json")
             .body_contains(regexp_message)
-            .body_contains(regexp_compute_state)
             .body_contains(regexp_arch)
             .body_contains(regexp_function_arn)
             .body_contains(regexp_extension_version);
@@ -62,7 +61,7 @@ async fn test_logs() {
         logs_aggr_service.run().await;
     });
 
-    let (mut logs_agent, logs_agent_tx) = LogsAgent::new(
+    let (mut logs_agent, logs_agent_tx, _durable_context_tx) = LogsAgent::new(
         tags_provider,
         Arc::clone(&arc_conf),
         bus_tx.clone(),
@@ -71,10 +70,12 @@ async fn test_logs() {
         None, // policy_evaluator
     );
     let api_key_factory = Arc::new(ApiKeyFactory::new(dd_api_key));
-    let logs_flusher = LogsFlusher::new(api_key_factory, logs_aggr_handle, arc_conf.clone());
+    let client = bottlecap::http::get_client(&Arc::clone(&arc_conf));
+    let logs_flusher =
+        LogsFlusher::new(api_key_factory, logs_aggr_handle, arc_conf.clone(), client);
 
     let telemetry_events: Vec<TelemetryEvent> = serde_json::from_str(
-        r#"[{"time":"2022-10-21T14:05:03.165Z","type":"platform.start","record":{"requestId":"459921b5-681c-4a96-beb0-81e0aa586026","version":"$LATEST","tracing":{"spanId":"24cd7d670fa455f0","type":"X-Amzn-Trace-Id","value":"Root=1-6352a70e-1e2c502e358361800241fd45;Parent=35465b3a9e2f7c6a;Sampled=1"}}}]"#)
+        r#"[{"time":"2022-10-21T14:05:03.000Z","type":"platform.initStart","record":{"initializationType":"on-demand","phase":"init"}},{"time":"2022-10-21T14:05:03.165Z","type":"platform.start","record":{"requestId":"459921b5-681c-4a96-beb0-81e0aa586026","version":"$LATEST","tracing":{"spanId":"24cd7d670fa455f0","type":"X-Amzn-Trace-Id","value":"Root=1-6352a70e-1e2c502e358361800241fd45;Parent=35465b3a9e2f7c6a;Sampled=1"}}}]"#)
         .map_err(|e| e.to_string()).expect("Failed parsing telemetry events");
 
     let sender = logs_agent_tx.clone();
@@ -84,9 +85,8 @@ async fn test_logs() {
             .send(an_event.clone())
             .await
             .expect("Failed sending telemetry events");
+        logs_agent.sync_consume().await;
     }
-
-    logs_agent.sync_consume().await;
 
     let _ = logs_flusher.flush(None).await;
 

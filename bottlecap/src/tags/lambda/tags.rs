@@ -38,17 +38,27 @@ const VERSION_KEY: &str = "version";
 // ServiceKey is the tag key for a function's service environment variable
 const SERVICE_KEY: &str = "service";
 
-// ComputeStatsKey is the tag key indicating whether trace stats should be computed
-const COMPUTE_STATS_KEY: &str = "_dd.compute_stats";
+// ComputeStatsKey is the tag key indicating whether trace stats should be computed.
+// This is a per-span backend directive that is stamped on each span's meta by the trace
+// processor (see `trace_processor::ChunkProcessor`), NOT baked into the function tags here.
+pub(crate) const COMPUTE_STATS_KEY: &str = "_dd.compute_stats";
 // FunctionTagsKey is the tag key for a function's tags to be set on the top level tracepayload
 const FUNCTION_TAGS_KEY: &str = "_dd.tags.function";
 // TODO(astuyve) decide what to do with the version
 const EXTENSION_VERSION_KEY: &str = "dd_extension_version";
 // TODO(duncanista) figure out a better way to not hardcode this
-pub const EXTENSION_VERSION: &str = "93-next";
+pub const EXTENSION_VERSION: &str = "98-next";
 
 const REGION_KEY: &str = "region";
 const ACCOUNT_ID_KEY: &str = "account_id";
+
+// Span tag keys for durable function execution context
+pub const REQUEST_ID_KEY: &str = "request_id";
+pub const DURABLE_EXECUTION_ID_KEY: &str = "aws.durable.execution_id";
+pub const DURABLE_EXECUTION_NAME_KEY: &str = "aws.durable.execution_name";
+pub const DURABLE_FUNCTION_FIRST_INVOCATION_KEY: &str = "aws.durable.first_invocation";
+pub const DURABLE_FUNCTION_EXECUTION_STATUS_KEY: &str = "aws.durable.execution_status";
+
 const AWS_ACCOUNT_KEY: &str = "aws_account";
 const RESOURCE_KEY: &str = "resource";
 
@@ -109,7 +119,7 @@ fn tags_from_env(
         tags_map.insert(MEMORY_SIZE_KEY.to_string(), memory_size);
     }
     if let Ok(runtime) = std::env::var(RUNTIME_VAR) {
-        if config.serverless_appsec_enabled
+        if config.ext.serverless_appsec_enabled
             && let Some(runtime_family) = identify_runtime_family(&runtime)
         {
             tags_map.insert(RUNTIME_FAMILY_KEY.to_string(), runtime_family.to_string());
@@ -127,11 +137,11 @@ fn tags_from_env(
         tags_map.extend(config.tags.clone());
     }
 
-    // The value of _dd.compute_stats is the opposite of config.compute_trace_stats_on_extension.
-    // "config.compute_trace_stats_on_extension == true" means computing stats on the extension side,
-    // so we set _dd.compute_stats to 0 so stats won't be computed on the backend side.
-    let compute_stats = i32::from(!config.compute_trace_stats_on_extension);
-    tags_map.insert(COMPUTE_STATS_KEY.to_string(), compute_stats.to_string());
+    // NOTE: `_dd.compute_stats` is intentionally NOT set here. It is a per-span backend
+    // directive (whether the backend should compute trace stats) that depends on both
+    // `lambda_extension_compute_stats` AND the tracer's `Datadog-Client-Computed-Stats`
+    // header. The trace processor stamps it on each span's meta at processing time; baking
+    // it into the function tags would leak it into `_dd.tags.function` and ignore the header.
 
     tags_map
 }
@@ -286,14 +296,19 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::Write;
-    use std::path::Path;
 
     #[test]
     fn test_new_from_config() {
         let metadata = HashMap::new();
         let tags = Lambda::new_from_config(Arc::new(Config::default()), &metadata);
-        assert_eq!(tags.tags_map.len(), 3);
-        assert_eq!(tags.tags_map.get(COMPUTE_STATS_KEY).unwrap(), "1");
+        assert_eq!(tags.tags_map.len(), 2);
+        // _dd.compute_stats is a per-span backend directive stamped by the trace processor,
+        // not a function tag. It must NOT be present in the tags map.
+        assert!(!tags.tags_map.contains_key(COMPUTE_STATS_KEY));
+        assert!(
+            !tags.get_tags_map().contains_key(COMPUTE_STATS_KEY),
+            "_dd.compute_stats must not leak into the tags map"
+        );
         let arch = arch_to_platform();
         assert_eq!(
             tags.tags_map.get(ARCHITECTURE_KEY).unwrap(),
@@ -360,8 +375,8 @@ mod tests {
 
     #[test]
     fn test_resolve_runtime() {
-        let proc_id_folder = Path::new("/tmp/test-bottlecap/proc_root/123");
-        fs::create_dir_all(proc_id_folder).unwrap();
+        let proc_id_folder = std::env::temp_dir().join("test-bottlecap/proc_root/123");
+        fs::create_dir_all(&proc_id_folder).unwrap();
         let path = proc_id_folder.join("environ");
         let content = "\0NAME =\"AmazonLinux\"\0V=\"2\0AWS_EXECUTION_ENV=\"AWS_Lambda_java123\"\0somethingelse=\"abd\0\"";
 
@@ -370,32 +385,33 @@ mod tests {
 
         let runtime =
             resolve_runtime_from_proc(proc_id_folder.parent().unwrap().to_str().unwrap(), "");
-        fs::remove_file(path).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir_all(std::env::temp_dir().join("test-bottlecap")).unwrap();
         assert_eq!(runtime, "java123");
     }
 
     #[test]
     fn test_resolve_provided_al2() {
-        let path = "/tmp/test-os-release1";
+        let path = std::env::temp_dir().join("test-os-release1");
         let content = "NAME =\"Amazon Linux\"\nVERSION=\"2\nPRETTY_NAME=\"Amazon Linux 2\"";
-        let mut file = File::create(path).unwrap();
+        let mut file = File::create(&path).unwrap();
         file.write_all(content.as_bytes()).unwrap();
 
-        let runtime = resolve_runtime_from_proc("", path);
-        fs::remove_file(path).unwrap();
+        let runtime = resolve_runtime_from_proc("", &path.to_string_lossy());
+        fs::remove_file(&path).unwrap();
         assert_eq!(runtime, "provided.al2");
     }
 
     #[test]
     fn test_resolve_provided_al2023() {
-        let path = "/tmp/test-os-release2";
+        let path = std::env::temp_dir().join("test-os-release2");
         let content =
             "NAME=\"Amazon Linux\"\nVERSION=\"2\nPRETTY_NAME=\"Amazon Linux 2023.4.20240429\"";
-        let mut file = File::create(path).unwrap();
+        let mut file = File::create(&path).unwrap();
         file.write_all(content.as_bytes()).unwrap();
 
-        let runtime = resolve_runtime_from_proc("", path);
-        fs::remove_file(path).unwrap();
+        let runtime = resolve_runtime_from_proc("", &path.to_string_lossy());
+        fs::remove_file(&path).unwrap();
         assert_eq!(runtime, "provided.al2023");
     }
 
@@ -428,7 +444,9 @@ mod tests {
                 (parts[0].to_string(), parts[1].to_string())
             })
             .collect();
-        assert_eq!(fn_tags_map.len(), 14);
+        assert_eq!(fn_tags_map.len(), 13);
+        // _dd.compute_stats is a per-span backend directive, not a function tag.
+        assert!(!fn_tags_map.contains_key(COMPUTE_STATS_KEY));
         assert_eq!(fn_tags_map.get("key1").unwrap(), "value1");
         assert_eq!(fn_tags_map.get("key2").unwrap(), "value2");
         assert_eq!(fn_tags_map.get(ACCOUNT_ID_KEY).unwrap(), "123456789012");
@@ -455,7 +473,10 @@ mod tests {
             ]),
             env: Some("test".to_string()),
             version: Some("1.0.0".to_string()),
-            serverless_appsec_enabled: true,
+            ext: crate::config::LambdaConfig {
+                serverless_appsec_enabled: true,
+                ..Default::default()
+            },
             ..Config::default()
         });
         let tags = Lambda::new_from_config(config, &metadata);
@@ -470,7 +491,9 @@ mod tests {
                 (parts[0].to_string(), parts[1].to_string())
             })
             .collect();
-        assert_eq!(fn_tags_map.len(), 14);
+        assert_eq!(fn_tags_map.len(), 13);
+        // _dd.compute_stats is a per-span backend directive, not a function tag.
+        assert!(!fn_tags_map.contains_key(COMPUTE_STATS_KEY));
         assert_eq!(fn_tags_map.get("key1").unwrap(), "value1");
         assert_eq!(fn_tags_map.get("key2").unwrap(), "value2");
         assert_eq!(fn_tags_map.get(ACCOUNT_ID_KEY).unwrap(), "123456789012");

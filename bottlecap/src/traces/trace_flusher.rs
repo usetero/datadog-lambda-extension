@@ -6,19 +6,33 @@ use libdd_common::Endpoint;
 use libdd_trace_utils::{
     config_utils::trace_intake_url_prefixed,
     send_data::SendData,
+    send_with_retry::{RetryBackoffType, RetryStrategy},
     trace_utils::{self},
     tracer_payload::TracerPayloadCollection,
 };
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
 use tracing::{debug, error};
 
+use crate::FLUSH_RETRY_COUNT;
 use crate::config::Config;
 use crate::lifecycle::invocation::processor::S_TO_MS;
-use crate::traces::http_client::{self, HttpClient};
+use crate::traces::http_client::HttpClient;
 use crate::traces::trace_aggregator_service::AggregatorHandle;
+
+/// Retry strategy for trace flushing using the shared `FLUSH_RETRY_COUNT`
+/// with no delay between attempts. In Lambda, every millisecond of wall-clock
+/// time matters, and the per-attempt request timeout already bounds how long
+/// each retry can take.
+fn trace_retry_strategy() -> RetryStrategy {
+    RetryStrategy::new(
+        u32::try_from(FLUSH_RETRY_COUNT).unwrap_or(3),
+        0,
+        RetryBackoffType::Constant,
+        None,
+    )
+}
 
 pub struct TraceFlusher {
     pub aggregator_handle: AggregatorHandle,
@@ -28,10 +42,7 @@ pub struct TraceFlusher {
     /// Configured via `DD_APM_ADDITIONAL_ENDPOINTS` (e.g., sending to both US and EU).
     /// Each trace batch is sent to the primary endpoint AND all additional endpoints.
     pub additional_endpoints: Vec<Endpoint>,
-    /// Cached HTTP client, lazily initialized on first use.
-    /// TODO: `TraceFlusher` and `StatsFlusher` both hit trace.agent.datadoghq.{site} and could
-    /// share a single HTTP client for better connection pooling.
-    http_client: OnceCell<HttpClient>,
+    http_client: HttpClient,
 }
 
 impl TraceFlusher {
@@ -40,6 +51,7 @@ impl TraceFlusher {
         aggregator_handle: AggregatorHandle,
         config: Arc<Config>,
         api_key_factory: Arc<ApiKeyFactory>,
+        http_client: HttpClient,
     ) -> Self {
         // Parse additional endpoints for dual-shipping from config.
         // Format: { "https://trace.agent.datadoghq.eu": ["api-key-1", "api-key-2"], ... }
@@ -65,7 +77,7 @@ impl TraceFlusher {
             config,
             api_key_factory,
             additional_endpoints,
-            http_client: OnceCell::new(),
+            http_client,
         }
     }
 
@@ -83,11 +95,7 @@ impl TraceFlusher {
             return None;
         };
 
-        // Get or create the cached HTTP client
-        let Some(http_client) = self.get_or_init_http_client().await else {
-            error!("TRACES | Failed to create HTTP client, skipping flush");
-            return None;
-        };
+        let http_client = &self.http_client;
 
         let mut failed_batch: Vec<SendData> = Vec::new();
 
@@ -120,7 +128,11 @@ impl TraceFlusher {
             let traces_with_tags: Vec<_> = trace_builders
                 .into_iter()
                 .map(|info| {
-                    let trace = info.builder.with_api_key(api_key.as_str()).build();
+                    let trace = info
+                        .builder
+                        .with_api_key(api_key.as_str())
+                        .with_retry_strategy(trace_retry_strategy())
+                        .build();
                     (trace, info.header_tags)
                 })
                 .collect();
@@ -132,12 +144,16 @@ impl TraceFlusher {
                 let additional_traces: Vec<_> = traces_with_tags
                     .iter()
                     .filter_map(|(trace, tags)| match trace.get_payloads() {
-                        TracerPayloadCollection::V07(payloads) => Some(SendData::new(
-                            trace.len(),
-                            TracerPayloadCollection::V07(payloads.clone()),
-                            tags.to_tracer_header_tags(),
-                            &endpoint,
-                        )),
+                        TracerPayloadCollection::V07(payloads) => {
+                            let mut send_data = SendData::new(
+                                trace.len(),
+                                TracerPayloadCollection::V07(payloads.clone()),
+                                tags.to_tracer_header_tags(),
+                                &endpoint,
+                            );
+                            send_data.set_retry_strategy(trace_retry_strategy());
+                            Some(send_data)
+                        }
                         // All payloads in the extension are V07 (produced by
                         // collect_pb_trace_chunks), so this branch is unreachable.
                         _ => None,
@@ -167,32 +183,6 @@ impl TraceFlusher {
         None
     }
 
-    /// Returns a clone of the cached HTTP client, initializing it if necessary.
-    ///
-    /// The client is created once and reused for all subsequent flushes,
-    /// providing connection pooling and TLS session reuse.
-    ///
-    /// Returns `None` if client creation fails. The error is logged but not cached,
-    /// allowing retry on subsequent calls.
-    async fn get_or_init_http_client(&self) -> Option<HttpClient> {
-        match self
-            .http_client
-            .get_or_try_init(|| async {
-                http_client::create_client(
-                    self.config.proxy_https.as_ref(),
-                    self.config.tls_cert_file.as_ref(),
-                )
-            })
-            .await
-        {
-            Ok(client) => Some(client.clone()),
-            Err(e) => {
-                error!("TRACES | Failed to create HTTP client: {e}");
-                None
-            }
-        }
-    }
-
     /// Sends traces to the Datadog intake endpoint using the provided HTTP client.
     ///
     /// Each `SendData` is sent to its own configured target endpoint.
@@ -207,12 +197,23 @@ impl TraceFlusher {
         debug!("TRACES | Flushing {} traces", coalesced_traces.len());
 
         for trace in &coalesced_traces {
-            let send_result = trace.send(&http_client).await.last_result;
+            let result = trace.send(&http_client).await;
 
-            if let Err(e) = send_result {
-                error!("TRACES | Request failed: {e:?}");
+            if let Err(e) = &result.last_result {
+                error!(
+                    "TRACES | Request failed after {} attempts ({} timeouts, {} network errors, {} status code errors): {e:?}",
+                    result.requests_count,
+                    result.errors_timeout,
+                    result.errors_network,
+                    result.errors_status_code,
+                );
                 return Some(coalesced_traces);
             }
+
+            debug!(
+                "TRACES | Successfully sent trace ({} attempts, {} bytes)",
+                result.requests_count, result.bytes_sent,
+            );
         }
 
         debug!("TRACES | Flushing took {} ms", start.elapsed().as_millis());

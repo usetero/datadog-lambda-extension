@@ -5,7 +5,9 @@ use crate::appsec::processor::Processor as AppSecProcessor;
 use crate::appsec::processor::context::HoldArguments;
 use crate::config;
 use crate::lifecycle::invocation::processor::S_TO_MS;
+use crate::lifecycle::invocation::triggers::get_default_service_name;
 use crate::policy::{PolicyEvaluator, SpanWrapper};
+use crate::tags::lambda::tags::COMPUTE_STATS_KEY;
 use crate::tags::provider;
 use crate::traces::span_pointers::{SpanPointer, attach_span_pointers_to_meta};
 use crate::traces::{
@@ -34,6 +36,28 @@ use tracing::{debug, error};
 
 use crate::traces::stats_generator::StatsGenerator;
 use crate::traces::trace_aggregator::{OwnedTracerHeaderTags, SendDataBuilderInfo};
+use libdd_trace_normalization::normalizer::SamplerPriority;
+
+/// Which party is responsible for computing trace stats for a trace, derived from
+/// `lambda_extension_compute_stats` and the tracer's `Datadog-Client-Computed-Stats`
+/// signal. Exactly one party computes, so the per-span `_dd.compute_stats` stamp and the
+/// extension-side stats-generation guards cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StatsComputedBy {
+    Backend,
+    Extension,
+    Tracer,
+}
+
+impl StatsComputedBy {
+    pub(crate) fn resolve(compute_on_extension: bool, client_computed_stats: bool) -> Self {
+        match (compute_on_extension, client_computed_stats) {
+            (_, true) => Self::Tracer, // tracer already computed client-side
+            (true, false) => Self::Extension,
+            (false, false) => Self::Backend,
+        }
+    }
+}
 
 #[derive(Clone)]
 #[allow(clippy::module_name_repetitions)]
@@ -47,6 +71,9 @@ struct ChunkProcessor {
     tags_provider: Arc<provider::Provider>,
     span_pointers: Option<Vec<SpanPointer>>,
     policy_evaluator: Option<Arc<PolicyEvaluator>>,
+    /// Whether the tracer signaled (via `Datadog-Client-Computed-Stats`) that it already
+    /// computed trace stats client-side. Used to decide whether to stamp `_dd.compute_stats`.
+    client_computed_stats: bool,
 }
 
 impl TraceChunkProcessor for ChunkProcessor {
@@ -72,6 +99,14 @@ impl TraceChunkProcessor for ChunkProcessor {
                 keep
             });
         }
+
+        // The stats-routing decision depends only on config and the per-request
+        // client_computed_stats flag, so resolve it once instead of per span.
+        let stamp_compute_stats = StatsComputedBy::resolve(
+            self.config.ext.lambda_extension_compute_stats,
+            self.client_computed_stats,
+        ) == StatsComputedBy::Backend;
+
         for span in &mut chunk.spans {
             // Service name could be incorrectly set to 'aws.lambda'
             // in datadog lambda libraries
@@ -81,12 +116,40 @@ impl TraceChunkProcessor for ChunkProcessor {
                 span.service.clone_from(service);
             }
 
-            // Remove the _dd.base_service tag for unintentional service name override
-            span.meta.remove("_dd.base_service");
+            // For inferred spans, set _dd.base_service to the resolved execution
+            // span service (same get_default_service_name used in processor.rs).
+            // This covers extension-only languages (Go, .NET, Java, Ruby).
+            if span.meta.contains_key("_inferred_span.tag_source")
+                && !span.meta.contains_key("_dd.base_service")
+            {
+                let base_service = get_default_service_name(
+                    &self
+                        .config
+                        .service
+                        .clone()
+                        .or_else(|| self.tags_provider.get_canonical_resource_name())
+                        .unwrap_or_else(|| "aws.lambda".to_string()),
+                    "aws.lambda",
+                    self.config.trace_aws_service_representation_enabled,
+                );
+                span.meta
+                    .insert("_dd.base_service".to_string(), base_service);
+            }
 
             self.tags_provider.get_tags_map().iter().for_each(|(k, v)| {
                 span.meta.insert(k.clone(), v.clone());
             });
+
+            // Stamp `_dd.compute_stats="1"` to tell the backend to compute trace stats ONLY
+            // when nobody else did: neither the extension (lambda_extension_compute_stats)
+            // nor the tracer (client_computed_stats). Otherwise leave the key absent, which the
+            // backend treats as "do not compute" (matching the Go agent's
+            // pkg/serverless/tags/tags.go semantics, which only ever set "1" and never "0").
+            if stamp_compute_stats {
+                span.meta
+                    .insert(COMPUTE_STATS_KEY.to_string(), "1".to_string());
+            }
+
             // TODO(astuyve) generalize this and delegate to an enum
             span.meta.insert("origin".to_string(), "lambda".to_string());
             span.meta
@@ -327,7 +390,7 @@ pub trait TraceProcessor {
         traces: Vec<Vec<pb::Span>>,
         body_size: usize,
         span_pointers: Option<Vec<SpanPointer>>,
-    ) -> (SendDataBuilderInfo, TracerPayloadCollection);
+    ) -> (Option<SendDataBuilderInfo>, TracerPayloadCollection);
 }
 
 #[async_trait]
@@ -340,7 +403,7 @@ impl TraceProcessor for ServerlessTraceProcessor {
         traces: Vec<Vec<pb::Span>>,
         body_size: usize,
         span_pointers: Option<Vec<SpanPointer>>,
-    ) -> (SendDataBuilderInfo, TracerPayloadCollection) {
+    ) -> (Option<SendDataBuilderInfo>, TracerPayloadCollection) {
         let mut payload = trace_utils::collect_pb_trace_chunks(
             traces,
             &header_tags,
@@ -350,6 +413,7 @@ impl TraceProcessor for ServerlessTraceProcessor {
                 tags_provider: tags_provider.clone(),
                 span_pointers,
                 policy_evaluator: None,
+                client_computed_stats: header_tags.client_computed_stats,
             },
             true, // send agentless since we are the agent
         )
@@ -376,6 +440,7 @@ impl TraceProcessor for ServerlessTraceProcessor {
 
         // Clone inner V07 payloads for stats generation (TracerPayload is Clone,
         // but TracerPayloadCollection is not).
+        // This clone is done BEFORE filtering so stats always include sampled-out traces.
         let payloads_for_stats = match &payload {
             TracerPayloadCollection::V07(payloads) => {
                 TracerPayloadCollection::V07(payloads.clone())
@@ -385,6 +450,35 @@ impl TraceProcessor for ServerlessTraceProcessor {
                 TracerPayloadCollection::V07(vec![])
             }
         };
+
+        // Remove sampled-out chunks so they won't be sent to Datadog.
+        // Sampled-out chunks are preserved in payloads_for_stats above so their
+        // stats are still counted. SamplerPriority::None (-128) means no explicit priority
+        // was set and the trace is kept; drop priorities are SamplerPriority::AutoDrop (0)
+        // and UserDrop (-1, not represented in SamplerPriority).
+        if config.ext.lambda_extension_compute_stats
+            && let TracerPayloadCollection::V07(ref mut tracer_payloads) = payload
+        {
+            for tp in tracer_payloads.iter_mut() {
+                tp.chunks.retain(|chunk| {
+                    chunk.priority > 0 || chunk.priority == SamplerPriority::None as i32
+                });
+            }
+            tracer_payloads.retain(|tp| !tp.chunks.is_empty());
+            if tracer_payloads.is_empty() {
+                return (None, payloads_for_stats);
+            }
+        }
+
+        let body_size = match &payload {
+            TracerPayloadCollection::V07(tracer_payloads) => tracer_payloads
+                .iter()
+                .map(prost::Message::encoded_len)
+                .sum(),
+            _ => body_size,
+        };
+
+        debug!("TRACES | trace payload size after enrichment: {body_size} bytes");
 
         let owned_header_tags = OwnedTracerHeaderTags::from(header_tags.clone());
 
@@ -399,7 +493,11 @@ impl TraceProcessor for ServerlessTraceProcessor {
             ));
 
         (
-            SendDataBuilderInfo::new(builder, body_size, owned_header_tags),
+            Some(SendDataBuilderInfo::new(
+                builder,
+                body_size,
+                owned_header_tags,
+            )),
             payloads_for_stats,
         )
     }
@@ -480,6 +578,9 @@ impl SendingTraceProcessor {
             return Ok(());
         }
 
+        // Capture before `header_tags` is moved into process_traces below.
+        let client_computed_stats = header_tags.client_computed_stats;
+
         let (payload, processed_traces) = self.processor.process_traces(
             config.clone(),
             tags_provider,
@@ -488,16 +589,24 @@ impl SendingTraceProcessor {
             body_size,
             span_pointers,
         );
-        self.trace_tx.send(payload).await?;
 
         // This needs to be after process_traces() because process_traces()
         // performs obfuscation, and we need to compute stats on the obfuscated traces.
-        if config.compute_trace_stats_on_extension
+        // Skip extension-side stats generation when the tracer already computed stats
+        // client-side (Datadog-Client-Computed-Stats), to avoid double-counting.
+        if StatsComputedBy::resolve(
+            config.ext.lambda_extension_compute_stats,
+            client_computed_stats,
+        ) == StatsComputedBy::Extension
             && let Err(err) = self.stats_generator.send(&processed_traces)
         {
             // Just log the error. We don't think trace stats are critical, so we don't want to
             // return an error if only stats fail to send.
             error!("TRACE_PROCESSOR | Error sending traces to the stats concentrator: {err}");
+        }
+
+        if let Some(payload) = payload {
+            self.trace_tx.send(payload).await?;
         }
         Ok(())
     }
@@ -594,13 +703,22 @@ mod tests {
     #[allow(clippy::unwrap_used)]
     #[cfg_attr(miri, ignore)]
     async fn test_process_trace() {
+        #[cfg(feature = "fips")]
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(not(feature = "fips"))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let start = get_current_timestamp_nanos();
 
         let tags_provider = create_tags_provider(create_test_config());
-        let span = create_test_span(11, 222, 333, start, true, tags_provider);
+        let mut span = create_test_span(11, 222, 333, start, true, tags_provider);
 
         let traces: Vec<Vec<pb::Span>> = vec![vec![span.clone()]];
+
+        // The trace processor stamps `_dd.compute_stats="1"` on each span's meta when neither
+        // the extension nor the tracer computes stats (default test config: both false).
+        // Mirror that on the expected span (input `traces` was already cloned above).
+        span.meta
+            .insert(COMPUTE_STATS_KEY.to_string(), "1".to_string());
 
         let header_tags = tracer_header_tags::TracerHeaderTags {
             lang: "nodejs",
@@ -630,6 +748,7 @@ mod tests {
             100,
             None,
         );
+        let tracer_payload = tracer_payload.expect("expected Some payload");
 
         let expected_tracer_payload = pb::TracerPayload {
             container_id: "33".to_string(),
@@ -887,6 +1006,7 @@ mod tests {
             )),
             span_pointers: None,
             policy_evaluator: None,
+            client_computed_stats: false,
         };
 
         processor.process(&mut chunk, 0);
@@ -972,6 +1092,7 @@ mod tests {
             )),
             span_pointers: None,
             policy_evaluator: None,
+            client_computed_stats: false,
         };
 
         processor.process(&mut chunk, 0);
@@ -1056,6 +1177,7 @@ mod tests {
             )),
             span_pointers: None,
             policy_evaluator: None,
+            client_computed_stats: false,
         };
 
         processor.process(&mut chunk, 0);
@@ -1065,5 +1187,734 @@ mod tests {
             2,
             "Trace should be kept when no filter tags are set."
         );
+    }
+
+    /// Verifies that when `lambda_extension_compute_stats` is true, `process_traces`
+    /// filters sampled-out chunks from the backend payload while preserving them in the
+    /// stats collection.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_process_traces_filters_sampled_out_chunks() {
+        use libdd_trace_obfuscation::obfuscation_config::ObfuscationConfig;
+
+        let config = Arc::new(Config {
+            apm_dd_url: "https://trace.agent.datadoghq.com".to_string(),
+            ext: crate::config::LambdaConfig {
+                lambda_extension_compute_stats: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        });
+        let tags_provider = Arc::new(Provider::new(
+            config.clone(),
+            "lambda".to_string(),
+            &std::collections::HashMap::from([(
+                "function_arn".to_string(),
+                "test-arn".to_string(),
+            )]),
+        ));
+        let processor = ServerlessTraceProcessor {
+            obfuscation_config: Arc::new(
+                ObfuscationConfig::new().expect("Failed to create ObfuscationConfig"),
+            ),
+        };
+
+        let header_tags = tracer_header_tags::TracerHeaderTags {
+            lang: "rust",
+            lang_version: "1.0",
+            lang_interpreter: "",
+            lang_vendor: "",
+            tracer_version: "1.0",
+            container_id: "",
+            client_computed_top_level: false,
+            client_computed_stats: false,
+            dropped_p0_traces: 0,
+            dropped_p0_spans: 0,
+        };
+
+        let make_span = |trace_id: u64, priority: Option<f64>| -> pb::Span {
+            let mut metrics = HashMap::new();
+            if let Some(p) = priority {
+                metrics.insert("_sampling_priority_v1".to_string(), p);
+            }
+            pb::Span {
+                trace_id,
+                span_id: trace_id,
+                parent_id: 0,
+                metrics,
+                service: "svc".to_string(),
+                name: "op".to_string(),
+                resource: "res".to_string(),
+                ..Default::default()
+            }
+        };
+
+        // Three traces: kept (priority 1), dropped (priority 0), dropped (priority -1)
+        let traces = vec![
+            vec![make_span(1, Some(1.0))],
+            vec![make_span(2, Some(0.0))],
+            vec![make_span(3, Some(-1.0))],
+        ];
+
+        let (payload_info, stats_collection) =
+            processor.process_traces(config, tags_provider, header_tags, traces, 0, None);
+        let payload_info = payload_info.expect("expected Some payload");
+
+        // Stats collection must include all three traces
+        let TracerPayloadCollection::V07(ref stats_payloads) = stats_collection else {
+            panic!("expected V07");
+        };
+        let stats_span_count: usize = stats_payloads
+            .iter()
+            .flat_map(|tp| tp.chunks.iter())
+            .map(|c| c.spans.len())
+            .sum();
+        assert_eq!(stats_span_count, 3, "stats must include all traces");
+
+        // Backend payload must only contain the kept trace (priority 1)
+        let backend_send_data = payload_info.builder.build();
+        let TracerPayloadCollection::V07(backend_payloads) = backend_send_data.get_payloads()
+        else {
+            panic!("expected V07");
+        };
+        let backend_span_count: usize = backend_payloads
+            .iter()
+            .flat_map(|tp| tp.chunks.iter())
+            .map(|c| c.spans.len())
+            .sum();
+        assert_eq!(
+            backend_span_count, 1,
+            "backend must only include kept traces"
+        );
+    }
+
+    /// Verifies that `process_traces` returns `None` for the backend payload when all
+    /// traces are sampled out and `lambda_extension_compute_stats` is true.
+    #[test]
+    fn test_process_traces_returns_none_when_all_sampled_out() {
+        use libdd_trace_obfuscation::obfuscation_config::ObfuscationConfig;
+
+        let config = Arc::new(Config {
+            apm_dd_url: "https://trace.agent.datadoghq.com".to_string(),
+            ext: crate::config::LambdaConfig {
+                lambda_extension_compute_stats: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        });
+        let tags_provider = Arc::new(Provider::new(
+            config.clone(),
+            "lambda".to_string(),
+            &std::collections::HashMap::from([(
+                "function_arn".to_string(),
+                "test-arn".to_string(),
+            )]),
+        ));
+        let processor = ServerlessTraceProcessor {
+            obfuscation_config: Arc::new(
+                ObfuscationConfig::new().expect("Failed to create ObfuscationConfig"),
+            ),
+        };
+        let header_tags = tracer_header_tags::TracerHeaderTags {
+            lang: "rust",
+            lang_version: "1.0",
+            lang_interpreter: "",
+            lang_vendor: "",
+            tracer_version: "1.0",
+            container_id: "",
+            client_computed_top_level: false,
+            client_computed_stats: false,
+            dropped_p0_traces: 0,
+            dropped_p0_spans: 0,
+        };
+
+        let make_dropped_span = |trace_id: u64| -> pb::Span {
+            let mut metrics = HashMap::new();
+            metrics.insert("_sampling_priority_v1".to_string(), -1.0_f64);
+            pb::Span {
+                trace_id,
+                span_id: trace_id,
+                parent_id: 0,
+                metrics,
+                service: "svc".to_string(),
+                name: "op".to_string(),
+                resource: "res".to_string(),
+                ..Default::default()
+            }
+        };
+
+        let traces = vec![vec![make_dropped_span(1)], vec![make_dropped_span(2)]];
+
+        let (payload, stats_collection) =
+            processor.process_traces(config, tags_provider, header_tags, traces, 0, None);
+
+        assert!(
+            payload.is_none(),
+            "backend payload must be None when all traces are sampled out"
+        );
+
+        // Stats collection must still include both traces
+        let TracerPayloadCollection::V07(ref stats_payloads) = stats_collection else {
+            panic!("expected V07");
+        };
+        let stats_span_count: usize = stats_payloads
+            .iter()
+            .flat_map(|tp| tp.chunks.iter())
+            .map(|c| c.spans.len())
+            .sum();
+        assert_eq!(
+            stats_span_count, 2,
+            "stats must include all traces even when all are sampled out"
+        );
+    }
+
+    /// Verifies that `body_size` in the returned `SendDataBuilderInfo` reflects the
+    /// protobuf-encoded size of the filtered payload, not the original request body.
+    #[test]
+    fn test_process_traces_body_size_reflects_filtered_payload() {
+        use libdd_trace_obfuscation::obfuscation_config::ObfuscationConfig;
+        use prost::Message as _;
+
+        let config = Arc::new(Config {
+            apm_dd_url: "https://trace.agent.datadoghq.com".to_string(),
+            ext: crate::config::LambdaConfig {
+                lambda_extension_compute_stats: true,
+                ..Default::default()
+            },
+            ..Config::default()
+        });
+        let tags_provider = Arc::new(Provider::new(
+            config.clone(),
+            "lambda".to_string(),
+            &std::collections::HashMap::from([(
+                "function_arn".to_string(),
+                "test-arn".to_string(),
+            )]),
+        ));
+        let processor = ServerlessTraceProcessor {
+            obfuscation_config: Arc::new(
+                ObfuscationConfig::new().expect("Failed to create ObfuscationConfig"),
+            ),
+        };
+        let header_tags = tracer_header_tags::TracerHeaderTags {
+            lang: "rust",
+            lang_version: "1.0",
+            lang_interpreter: "",
+            lang_vendor: "",
+            tracer_version: "1.0",
+            container_id: "",
+            client_computed_top_level: false,
+            client_computed_stats: false,
+            dropped_p0_traces: 0,
+            dropped_p0_spans: 0,
+        };
+
+        let make_span = |trace_id: u64, priority: f64| -> pb::Span {
+            let mut metrics = HashMap::new();
+            metrics.insert("_sampling_priority_v1".to_string(), priority);
+            pb::Span {
+                trace_id,
+                span_id: trace_id,
+                parent_id: 0,
+                metrics,
+                service: "svc".to_string(),
+                name: "op".to_string(),
+                resource: "res".to_string(),
+                ..Default::default()
+            }
+        };
+
+        // 1 kept trace, 3 dropped traces; original body_size is intentionally large
+        let traces = vec![
+            vec![make_span(1, 1.0)],
+            vec![make_span(2, -1.0)],
+            vec![make_span(3, -1.0)],
+            vec![make_span(4, -1.0)],
+        ];
+
+        let (payload_info, stats_collection) =
+            processor.process_traces(config, tags_provider, header_tags, traces, 999_999, None);
+
+        let info = payload_info.expect("expected Some payload");
+
+        // The reported size must equal the sum of encoded_len() of the kept TracerPayloads.
+        // stats_collection has all 4 traces. Reconstruct the filtered payload (only trace_id=1
+        // was kept with priority=1) and compute its encoded_len.
+        let TracerPayloadCollection::V07(ref all_payloads) = stats_collection else {
+            panic!("expected V07");
+        };
+        let expected_size: usize = all_payloads
+            .iter()
+            .filter_map(|tp| {
+                let kept_chunks: Vec<pb::TraceChunk> = tp
+                    .chunks
+                    .iter()
+                    .filter(|c| c.spans.iter().any(|s| s.trace_id == 1))
+                    .cloned()
+                    .collect();
+                if kept_chunks.is_empty() {
+                    None
+                } else {
+                    Some(pb::TracerPayload {
+                        chunks: kept_chunks,
+                        ..tp.clone()
+                    })
+                }
+            })
+            .map(|tp| tp.encoded_len())
+            .sum();
+
+        assert!(
+            expected_size > 0,
+            "expected_size must be non-zero for a non-empty payload"
+        );
+        assert_eq!(
+            info.size, expected_size,
+            "body_size must equal protobuf encoded_len of the filtered payload"
+        );
+        assert!(
+            info.size < 999_999,
+            "body_size must be smaller than the original unfiltered request size"
+        );
+    }
+
+    /// `process_traces` enriches every span (adding the tags-provider map), so the
+    /// payload it sends is larger than the raw msgpack the tracer posted. `body_size`
+    /// must reflect that enriched, protobuf-encoded size — not the smaller ingress
+    /// size — otherwise the aggregator/coalesce caps undercount and oversized payloads
+    /// reach the backend and get a 413. This is the default config (no local stats).
+    #[test]
+    fn test_process_traces_body_size_reflects_enriched_payload() {
+        use libdd_trace_obfuscation::obfuscation_config::ObfuscationConfig;
+
+        let config = Arc::new(Config {
+            apm_dd_url: "https://trace.agent.datadoghq.com".to_string(),
+            ..Config::default()
+        });
+        let tags_provider = Arc::new(Provider::new(
+            config.clone(),
+            "lambda".to_string(),
+            &std::collections::HashMap::from([(
+                "function_arn".to_string(),
+                "test-arn".to_string(),
+            )]),
+        ));
+        let processor = ServerlessTraceProcessor {
+            obfuscation_config: Arc::new(
+                ObfuscationConfig::new().expect("Failed to create ObfuscationConfig"),
+            ),
+        };
+        let header_tags = tracer_header_tags::TracerHeaderTags {
+            lang: "rust",
+            lang_version: "1.0",
+            lang_interpreter: "",
+            lang_vendor: "",
+            tracer_version: "1.0",
+            container_id: "",
+            client_computed_top_level: false,
+            client_computed_stats: false,
+            dropped_p0_traces: 0,
+            dropped_p0_spans: 0,
+        };
+
+        let span = pb::Span {
+            trace_id: 1,
+            span_id: 1,
+            parent_id: 0,
+            service: "svc".to_string(),
+            name: "op".to_string(),
+            resource: "res".to_string(),
+            ..Default::default()
+        };
+        let traces = vec![vec![span]];
+
+        // Ingress size smaller than any real enriched payload, as it always is in
+        // production (raw msgpack < enriched protobuf).
+        let ingress_size = 1;
+        let (payload_info, processed_payloads) = processor.process_traces(
+            config,
+            tags_provider,
+            header_tags,
+            traces,
+            ingress_size,
+            None,
+        );
+
+        let info = payload_info.expect("expected Some payload");
+
+        // Nothing is filtered here, so the returned payloads are exactly what gets sent.
+        let TracerPayloadCollection::V07(ref payloads) = processed_payloads else {
+            panic!("expected V07");
+        };
+        let enriched_size: usize = payloads.iter().map(prost::Message::encoded_len).sum();
+
+        assert_eq!(
+            info.size, enriched_size,
+            "body_size must equal the protobuf encoded_len of the sent payload"
+        );
+        assert!(
+            info.size > ingress_size,
+            "enrichment inflates the payload, so body_size must exceed the ingress size"
+        );
+    }
+
+    fn create_inferred_span() -> pb::Span {
+        let mut meta = HashMap::new();
+        meta.insert("_inferred_span.tag_source".to_string(), "self".to_string());
+        pb::Span {
+            name: "aws.sqs".to_string(),
+            service: "sqs".to_string(),
+            resource: "my-queue".to_string(),
+            trace_id: 1,
+            span_id: 2,
+            parent_id: 0,
+            start: 1000,
+            duration: 500,
+            error: 0,
+            meta,
+            metrics: HashMap::new(),
+            r#type: "web".to_string(),
+            span_links: vec![],
+            meta_struct: HashMap::new(),
+            span_events: vec![],
+        }
+    }
+
+    fn create_chunk_processor(config: Arc<Config>) -> ChunkProcessor {
+        create_chunk_processor_with(config, false)
+    }
+
+    fn create_chunk_processor_with(
+        config: Arc<Config>,
+        client_computed_stats: bool,
+    ) -> ChunkProcessor {
+        let tags_provider = create_tags_provider(config.clone());
+        ChunkProcessor {
+            config,
+            obfuscation_config: Arc::new(
+                ObfuscationConfig::new().expect("Failed to create ObfuscationConfig"),
+            ),
+            tags_provider,
+            span_pointers: None,
+            policy_evaluator: None,
+            client_computed_stats,
+        }
+    }
+
+    #[test]
+    fn test_base_service_uses_function_name_when_no_dd_service() {
+        let config = Arc::new(Config {
+            service: None,
+            trace_aws_service_representation_enabled: true,
+            ..Config::default()
+        });
+        let mut processor = create_chunk_processor(config);
+
+        let inferred_span = create_inferred_span();
+        let mut chunk = pb::TraceChunk {
+            priority: 1,
+            origin: "lambda".to_string(),
+            spans: vec![inferred_span],
+            tags: HashMap::new(),
+            dropped_trace: false,
+        };
+
+        processor.process(&mut chunk, 0);
+
+        assert_eq!(
+            chunk.spans[0]
+                .meta
+                .get("_dd.base_service")
+                .expect("_dd.base_service should be present"),
+            "my-function",
+            "base_service should be the function name when DD_SERVICE is not set"
+        );
+    }
+
+    #[test]
+    fn test_base_service_uses_dd_service_when_set() {
+        let config = Arc::new(Config {
+            service: Some("my-payments-api".to_string()),
+            trace_aws_service_representation_enabled: true,
+            ..Config::default()
+        });
+        let mut processor = create_chunk_processor(config);
+
+        let inferred_span = create_inferred_span();
+        let mut chunk = pb::TraceChunk {
+            priority: 1,
+            origin: "lambda".to_string(),
+            spans: vec![inferred_span],
+            tags: HashMap::new(),
+            dropped_trace: false,
+        };
+
+        processor.process(&mut chunk, 0);
+
+        assert_eq!(
+            chunk.spans[0]
+                .meta
+                .get("_dd.base_service")
+                .expect("_dd.base_service should be present"),
+            "my-payments-api",
+            "base_service should be DD_SERVICE when set"
+        );
+    }
+
+    #[test]
+    fn test_base_service_is_aws_lambda_when_representation_disabled() {
+        let config = Arc::new(Config {
+            service: Some("my-payments-api".to_string()),
+            trace_aws_service_representation_enabled: false,
+            ..Config::default()
+        });
+        let mut processor = create_chunk_processor(config);
+
+        let inferred_span = create_inferred_span();
+        let mut chunk = pb::TraceChunk {
+            priority: 1,
+            origin: "lambda".to_string(),
+            spans: vec![inferred_span],
+            tags: HashMap::new(),
+            dropped_trace: false,
+        };
+
+        processor.process(&mut chunk, 0);
+
+        assert_eq!(
+            chunk.spans[0]
+                .meta
+                .get("_dd.base_service")
+                .expect("_dd.base_service should be present"),
+            "aws.lambda",
+            "base_service should be 'aws.lambda' when representation is disabled"
+        );
+    }
+
+    #[test]
+    fn test_base_service_not_set_on_non_inferred_spans() {
+        let config = Arc::new(Config {
+            service: Some("my-service".to_string()),
+            trace_aws_service_representation_enabled: true,
+            ..Config::default()
+        });
+        let mut processor = create_chunk_processor(config);
+
+        let regular_span = pb::Span {
+            name: "http.request".to_string(),
+            service: "my-service".to_string(),
+            resource: "GET /users".to_string(),
+            trace_id: 1,
+            span_id: 3,
+            parent_id: 0,
+            start: 1000,
+            duration: 500,
+            error: 0,
+            meta: HashMap::new(),
+            metrics: HashMap::new(),
+            r#type: "web".to_string(),
+            span_links: vec![],
+            meta_struct: HashMap::new(),
+            span_events: vec![],
+        };
+        let mut chunk = pb::TraceChunk {
+            priority: 1,
+            origin: "lambda".to_string(),
+            spans: vec![regular_span],
+            tags: HashMap::new(),
+            dropped_trace: false,
+        };
+
+        processor.process(&mut chunk, 0);
+
+        assert!(
+            !chunk.spans[0].meta.contains_key("_dd.base_service"),
+            "base_service should not be set on non-inferred spans"
+        );
+    }
+
+    #[test]
+    fn test_base_service_not_overwritten_when_already_set() {
+        let config = Arc::new(Config {
+            service: Some("my-service".to_string()),
+            trace_aws_service_representation_enabled: true,
+            ..Config::default()
+        });
+        let mut processor = create_chunk_processor(config);
+
+        let mut inferred_span = create_inferred_span();
+        inferred_span.meta.insert(
+            "_dd.base_service".to_string(),
+            "tracer-set-value".to_string(),
+        );
+        let mut chunk = pb::TraceChunk {
+            priority: 1,
+            origin: "lambda".to_string(),
+            spans: vec![inferred_span],
+            tags: HashMap::new(),
+            dropped_trace: false,
+        };
+
+        processor.process(&mut chunk, 0);
+
+        assert_eq!(
+            chunk.spans[0]
+                .meta
+                .get("_dd.base_service")
+                .expect("_dd.base_service should be present"),
+            "tracer-set-value",
+            "base_service should not be overwritten when already set by the tracer"
+        );
+    }
+
+    /// APMSVLS-487 Tier 1: `ChunkProcessor::process` stamps `_dd.compute_stats="1"` on each
+    /// span's meta IFF neither the extension nor the tracer computes stats; otherwise the key
+    /// is absent. Assert directly on `Span.meta` (NOT `TracerPayload.tags`) — guards #1118.
+    #[test]
+    fn test_compute_stats_truth_table() {
+        // (lambda_extension_compute_stats, client_computed_stats) -> expected meta value
+        let cases = [
+            (false, false, Some("1")), // nobody computed -> tell backend to compute
+            (false, true, None),       // tracer computed -> absent
+            (true, false, None),       // extension computes -> absent
+            (true, true, None),        // both -> absent
+        ];
+
+        for (compute_on_extension, client_computed_stats, expected) in cases {
+            let config = Arc::new(Config {
+                ext: crate::config::LambdaConfig {
+                    lambda_extension_compute_stats: compute_on_extension,
+                    ..Default::default()
+                },
+                ..Config::default()
+            });
+            let mut processor = create_chunk_processor_with(config, client_computed_stats);
+
+            let span = pb::Span {
+                name: "http.request".to_string(),
+                service: "my-service".to_string(),
+                resource: "GET /users".to_string(),
+                trace_id: 1,
+                span_id: 2,
+                parent_id: 0,
+                start: 1000,
+                duration: 500,
+                error: 0,
+                meta: HashMap::new(),
+                metrics: HashMap::new(),
+                r#type: "web".to_string(),
+                meta_struct: HashMap::new(),
+                span_links: vec![],
+                span_events: vec![],
+            };
+            let mut chunk = pb::TraceChunk {
+                priority: 1,
+                origin: "lambda".to_string(),
+                spans: vec![span],
+                tags: HashMap::new(),
+                dropped_trace: false,
+            };
+
+            processor.process(&mut chunk, 0);
+
+            let actual = chunk.spans[0]
+                .meta
+                .get(COMPUTE_STATS_KEY)
+                .map(String::as_str);
+            assert_eq!(
+                actual, expected,
+                "compute_on_extension={compute_on_extension}, client_computed_stats={client_computed_stats}"
+            );
+        }
+    }
+
+    /// APMSVLS-487 Tier 1: `send_processed_traces` only generates extension-side stats when
+    /// `lambda_extension_compute_stats == true AND client_computed_stats == false`. Drive the
+    /// real concentrator and assert a flushed payload is present/absent accordingly.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    #[cfg_attr(miri, ignore)]
+    async fn test_stats_skip_guard_via_send_processed_traces() {
+        use crate::traces::stats_concentrator_service::StatsConcentratorService;
+
+        #[cfg(feature = "fips")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(not(feature = "fips"))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // (compute_on_extension, client_computed_stats) -> stats payload expected?
+        let cases = [
+            (true, false, true),   // extension computes, tracer didn't -> stats generated
+            (true, true, false),   // tracer computed -> skip
+            (false, false, false), // extension doesn't compute -> skip
+            (false, true, false),  // both off / tracer computed -> skip
+        ];
+
+        for (compute_on_extension, client_computed_stats, expect_stats) in cases {
+            let config = Arc::new(Config {
+                apm_dd_url: "https://trace.agent.datadoghq.com".to_string(),
+                service: Some("test-service".to_string()),
+                ext: crate::config::LambdaConfig {
+                    lambda_extension_compute_stats: compute_on_extension,
+                    ..Default::default()
+                },
+                ..Config::default()
+            });
+
+            let (concentrator_service, concentrator_handle) =
+                StatsConcentratorService::new(config.clone());
+            tokio::spawn(concentrator_service.run());
+
+            let (trace_tx, mut trace_rx) = tokio::sync::mpsc::channel(8);
+            // Drain the trace channel so send() never blocks.
+            tokio::spawn(async move { while trace_rx.recv().await.is_some() {} });
+
+            let sender = SendingTraceProcessor {
+                appsec: None,
+                processor: Arc::new(ServerlessTraceProcessor {
+                    obfuscation_config: Arc::new(
+                        ObfuscationConfig::new().expect("Failed to create ObfuscationConfig"),
+                    ),
+                }),
+                trace_tx,
+                stats_generator: Arc::new(StatsGenerator::new(concentrator_handle.clone())),
+            };
+
+            let start = get_current_timestamp_nanos();
+            let tags_provider = create_tags_provider(config.clone());
+            let span = create_test_span(1, 2, 0, start, true, tags_provider.clone());
+            let header_tags = tracer_header_tags::TracerHeaderTags {
+                lang: "nodejs",
+                lang_version: "v19.7.0",
+                lang_interpreter: "v8",
+                lang_vendor: "vendor",
+                tracer_version: "4.0.0",
+                container_id: "33",
+                client_computed_top_level: false,
+                client_computed_stats,
+                dropped_p0_traces: 0,
+                dropped_p0_spans: 0,
+            };
+
+            sender
+                .send_processed_traces(
+                    config,
+                    tags_provider,
+                    header_tags,
+                    vec![vec![span]],
+                    100,
+                    None,
+                )
+                .await
+                .expect("send_processed_traces failed");
+
+            let payload = concentrator_handle.flush(true).await.expect("flush failed");
+
+            assert_eq!(
+                payload.is_some(),
+                expect_stats,
+                "compute_on_extension={compute_on_extension}, client_computed_stats={client_computed_stats}"
+            );
+        }
     }
 }

@@ -5,11 +5,20 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use datadog_opentelemetry::propagation::{
+    context::SpanContext,
+    datadog::{
+        DATADOG_PARENT_ID_KEY, DATADOG_SAMPLING_PRIORITY_KEY, DATADOG_TAGS_KEY,
+        DATADOG_TRACE_ID_KEY,
+    },
+};
 use libdd_trace_protobuf::pb::Span;
 use libdd_trace_utils::tracer_header_tags;
 use serde_json::Value;
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::{debug, error, trace, warn};
+
+use tokio::sync::mpsc;
 
 use crate::{
     config::{self, aws::AwsConfig},
@@ -24,6 +33,7 @@ use crate::{
         span_inferrer::{self, SpanInferrer},
         triggers::get_default_service_name,
     },
+    logs::lambda::DurableContextUpdate,
     metrics::enhanced::lambda::{EnhancedMetricData, Lambda as EnhancedMetrics},
     proc::{
         self, CPUData, NetworkData,
@@ -31,14 +41,7 @@ use crate::{
     },
     tags::{lambda::tags::resolve_runtime_from_proc, provider},
     traces::{
-        context::SpanContext,
-        propagation::{
-            DatadogCompositePropagator, Propagator,
-            text_map_propagator::{
-                DATADOG_PARENT_ID_KEY, DATADOG_SAMPLING_PRIORITY_KEY, DATADOG_SPAN_ID_KEY,
-                DATADOG_TRACE_ID_KEY, DatadogHeaderPropagator,
-            },
-        },
+        propagation::{DatadogCompositePropagator, carrier::JsonCarrier},
         trace_processor::SendingTraceProcessor,
     },
 };
@@ -46,12 +49,18 @@ use crate::{
 pub const MS_TO_NS: f64 = 1_000_000.0;
 pub const S_TO_MS: u64 = 1_000;
 pub const S_TO_NS: f64 = 1_000_000_000.0;
+/// Threshold for classifying a Lambda cold start as proactive initialization.
+///
+/// Proactive initialization is a Lambda optimization where the runtime pre-initializes
+/// a sandbox before any invocation is scheduled, to reduce cold start latency for future
+/// requests.
 pub const PROACTIVE_INITIALIZATION_THRESHOLD_MS: u64 = 10_000;
 
 pub const DATADOG_INVOCATION_ERROR_MESSAGE_KEY: &str = "x-datadog-invocation-error-msg";
 pub const DATADOG_INVOCATION_ERROR_TYPE_KEY: &str = "x-datadog-invocation-error-type";
 pub const DATADOG_INVOCATION_ERROR_STACK_KEY: &str = "x-datadog-invocation-error-stack";
 pub const DATADOG_INVOCATION_ERROR_KEY: &str = "x-datadog-invocation-error";
+const DATADOG_SPAN_ID_KEY: &str = "x-datadog-span-id";
 const TAG_SAMPLING_PRIORITY: &str = "_sampling_priority_v1";
 
 pub struct Processor {
@@ -88,6 +97,20 @@ pub struct Processor {
     /// Tracks whether if first invocation after init has been received in Managed Instance mode.
     /// Used to determine if we should search for the empty context on an invocation.
     awaiting_first_invocation: bool,
+    /// Sender used to forward durable execution context extracted from `aws.lambda` spans to the
+    /// logs agent. Decouples the trace agent from the logs agent: the trace agent sends spans
+    /// to the lifecycle processor, which extracts durable context and relays it here.
+    durable_context_tx: mpsc::Sender<DurableContextUpdate>,
+    /// Time of the `SnapStart` restore event, set when `PlatformRestoreStart` is received.
+    restore_time: Option<Instant>,
+    /// Whether the init duration metric has already been emitted for this sandbox.
+    ///
+    /// Init happens once per sandbox lifetime, so the metric must be emitted at most once.
+    /// The init duration metric is normally emitted from the `platform.initReport` telemetry event,
+    /// but if it does not arrive / arrives late, we fall back to the `init_duration_ms` field
+    /// on `platform.report`. This flag ensures whichever event arrives first wins and the other is skipped,
+    /// preventing double counting.
+    init_duration_metric_emitted: bool,
 }
 
 impl Processor {
@@ -96,8 +119,9 @@ impl Processor {
         tags_provider: Arc<provider::Provider>,
         config: Arc<config::Config>,
         aws_config: Arc<AwsConfig>,
-        metrics_aggregator: dogstatsd::aggregator_service::AggregatorHandle,
+        metrics_aggregator: dogstatsd::aggregator::AggregatorHandle,
         propagator: Arc<DatadogCompositePropagator>,
+        durable_context_tx: mpsc::Sender<DurableContextUpdate>,
     ) -> Self {
         let resource = tags_provider
             .get_canonical_resource_name()
@@ -127,6 +151,9 @@ impl Processor {
             dynamic_tags: HashMap::new(),
             active_invocations: 0,
             awaiting_first_invocation: false,
+            durable_context_tx,
+            restore_time: None,
+            init_duration_metric_emitted: false,
         }
     }
 
@@ -168,7 +195,7 @@ impl Processor {
             .try_into()
             .unwrap_or_default();
 
-        if self.config.lambda_proc_enhanced_metrics {
+        if self.config.ext.lambda_proc_enhanced_metrics {
             if self.aws_config.is_managed_instance_mode() {
                 // In Managed Instance mode, track concurrent invocations
                 self.active_invocations += 1;
@@ -201,34 +228,32 @@ impl Processor {
         self.enhanced_metrics.increment_invocation_metric(timestamp);
         self.enhanced_metrics.set_invoked_received();
 
-        // MANAGED INSTANCE MODE: Check for buffered UniversalInstrumentationStart with request_id
-        if self.aws_config.is_managed_instance_mode() {
-            if let Some(buffered_event) = self
-                .context_buffer
-                .take_universal_instrumentation_start_for_request_id(&request_id)
-            {
-                debug!(
-                    "Managed Instance: Found buffered UniversalInstrumentationStart for request_id: {}",
-                    request_id
-                );
-                // Infer span
-                self.inferrer
-                    .infer_span(&buffered_event.payload_value, &self.aws_config);
-                self.process_on_universal_instrumentation_start(
-                    request_id,
-                    buffered_event.headers,
-                    buffered_event.payload_value,
-                );
-            }
-            return;
-        }
-
-        // ON-DEMAND MODE: Use existing FIFO pairing logic (unchanged)
-        // If `UniversalInstrumentationStart` event happened first, process it
-        if let Some((headers, payload_value)) = self.context_buffer.pair_invoke_event(&request_id) {
+        // Both modes: check for buffered UniversalInstrumentationStart by request_id first.
+        // Falls back to FIFO for on-demand when the tracer does not send the header.
+        if let Some(buffered_event) = self
+            .context_buffer
+            .take_universal_instrumentation_start_for_request_id(&request_id)
+        {
+            debug!(
+                "Found buffered UniversalInstrumentationStart for request_id: {}",
+                request_id
+            );
             // Infer span
-            self.inferrer.infer_span(&payload_value, &self.aws_config);
-            self.process_on_universal_instrumentation_start(request_id, headers, payload_value);
+            self.inferrer
+                .infer_span(&buffered_event.payload_value, &self.aws_config);
+            self.process_on_universal_instrumentation_start(
+                request_id,
+                buffered_event.headers,
+                buffered_event.payload_value,
+            );
+        } else if !self.aws_config.is_managed_instance_mode() {
+            // ON-DEMAND MODE FIFO fallback: for tracers that do not send request_id headers.
+            if let Some((headers, payload_value)) =
+                self.context_buffer.pair_invoke_event(&request_id)
+            {
+                self.inferrer.infer_span(&payload_value, &self.aws_config);
+                self.process_on_universal_instrumentation_start(request_id, headers, payload_value);
+            }
         }
     }
 
@@ -242,12 +267,35 @@ impl Processor {
 
         // If it's empty, then we are in a cold start
         if self.context_buffer.is_empty() {
-            let now = Instant::now();
-            let time_since_sandbox_init = now.duration_since(self.aws_config.sandbox_init_time);
-            if time_since_sandbox_init.as_millis() > PROACTIVE_INITIALIZATION_THRESHOLD_MS.into() {
-                proactive_initialization = true;
+            if self.aws_config.is_snapstart() {
+                match self.restore_time {
+                    None => {
+                        // PlatformRestoreStart hasn't arrived yet — restore and invoke
+                        // happened close together, so this is a cold start (not proactive).
+                        cold_start = true;
+                    }
+                    Some(restore_time) => {
+                        let now = Instant::now();
+                        let time_since_restore = now.duration_since(restore_time);
+                        if time_since_restore.as_millis()
+                            > PROACTIVE_INITIALIZATION_THRESHOLD_MS.into()
+                        {
+                            proactive_initialization = true;
+                        } else {
+                            cold_start = true;
+                        }
+                    }
+                }
             } else {
-                cold_start = true;
+                let now = Instant::now();
+                let time_since_sandbox_init = now.duration_since(self.aws_config.sandbox_init_time);
+                if time_since_sandbox_init.as_millis()
+                    > PROACTIVE_INITIALIZATION_THRESHOLD_MS.into()
+                {
+                    proactive_initialization = true;
+                } else {
+                    cold_start = true;
+                }
             }
 
             // Resolve runtime only once
@@ -284,7 +332,13 @@ impl Processor {
     ///
     /// This is used to create a cold start span, since this telemetry event does not
     /// provide a `request_id`, we try to guess which invocation is the cold start.
-    pub fn on_platform_init_start(&mut self, time: DateTime<Utc>) {
+    pub fn on_platform_init_start(&mut self, time: DateTime<Utc>, runtime_version: Option<String>) {
+        if runtime_version
+            .as_deref()
+            .is_some_and(|rv| rv.contains("DurableFunction"))
+        {
+            self.enhanced_metrics.set_durable_function_tag();
+        }
         let start_time: i64 = SystemTime::from(time)
             .duration_since(UNIX_EPOCH)
             .expect("time went backwards")
@@ -339,8 +393,19 @@ impl Processor {
         duration_ms: f64,
         timestamp: i64,
     ) {
-        self.enhanced_metrics
-            .set_init_duration_metric(init_type, duration_ms, timestamp);
+        // `platform.initReport` is the primary source for the init duration metric and carries the exact `init_type`.
+        // If the init duration metric has already been emitted, it means the init report event was received late /
+        // the platform report event with init duration was received first.
+        // In this case, we skip emitting the init duration metric from the platform init report event, to prevent double counting.
+        if self.init_duration_metric_emitted {
+            debug!(
+                "Skipping init duration metric on PlatformInitReport, metric was already emitted on PlatformReport"
+            );
+        } else {
+            self.enhanced_metrics
+                .set_init_duration_metric(init_type, duration_ms, timestamp);
+            self.init_duration_metric_emitted = true;
+        }
 
         // In Managed Instance mode, find the context with empty request_id
         // In On-Demand mode, find the closest context by timestamp since we do not have the request_id
@@ -367,6 +432,8 @@ impl Processor {
     /// This is used to create a `snapstart_restore` span, since this telemetry event does not
     /// provide a `request_id`, we try to guess which invocation is the restore similar to init.
     pub fn on_platform_restore_start(&mut self, time: DateTime<Utc>) {
+        self.restore_time = Some(Instant::now());
+
         let start_time: i64 = SystemTime::from(time)
             .duration_since(UNIX_EPOCH)
             .expect("time went backwards")
@@ -459,7 +526,7 @@ impl Processor {
                 debug!(
                     "Invocation Processor | PlatformRuntimeDone | Got Runtime.OutOfMemory. Incrementing OOM metric."
                 );
-                self.enhanced_metrics.increment_oom_metric(timestamp);
+                self.try_increment_oom_metric(Some(request_id), timestamp);
             }
         }
 
@@ -472,25 +539,23 @@ impl Processor {
         self.context_buffer
             .add_runtime_duration(request_id, metrics.duration_ms);
 
-        // MANAGED INSTANCE MODE: Check for buffered UniversalInstrumentationEnd with request_id
-        if self.aws_config.is_managed_instance_mode() {
-            if let Some(buffered_event) = self
-                .context_buffer
-                .take_universal_instrumentation_end_for_request_id(request_id)
-            {
-                debug!(
-                    "Managed Instance: Found buffered UniversalInstrumentationEnd for request_id: {}",
-                    request_id
-                );
-                self.process_on_universal_instrumentation_end(
-                    request_id.clone(),
-                    buffered_event.headers,
-                    buffered_event.payload_value,
-                );
-            }
-        } else {
-            // ON-DEMAND MODE: Use existing FIFO pairing logic (unchanged)
-            // If `UniversalInstrumentationEnd` event happened first, process it first
+        // Both modes: check for buffered UniversalInstrumentationEnd by request_id first.
+        // Falls back to FIFO for on-demand when the tracer does not send the header.
+        if let Some(buffered_event) = self
+            .context_buffer
+            .take_universal_instrumentation_end_for_request_id(request_id)
+        {
+            debug!(
+                "Found buffered UniversalInstrumentationEnd for request_id: {}",
+                request_id
+            );
+            self.process_on_universal_instrumentation_end(
+                request_id.clone(),
+                buffered_event.headers,
+                buffered_event.payload_value,
+            );
+        } else if !self.aws_config.is_managed_instance_mode() {
+            // ON-DEMAND MODE FIFO fallback: for tracers that do not send request_id headers.
             if let Some((headers, payload)) = self
                 .context_buffer
                 .pair_platform_runtime_done_event(request_id)
@@ -531,6 +596,7 @@ impl Processor {
         request_id: &String,
         status: Status,
     ) -> Option<Context> {
+        let tracer_detected = self.tracer_detected;
         let Some(context) = self.context_buffer.get_mut(request_id) else {
             debug!(
                 "Cannot process on platform runtime done, no invocation context found for request_id: {request_id}"
@@ -566,7 +632,6 @@ impl Processor {
             );
         }
 
-        // todo(duncanista): Add missing metric tags for ASM
         // Add dynamic and trigger tags
         context
             .invocation_span
@@ -577,12 +642,29 @@ impl Processor {
             context.invocation_span.meta.extend(trigger_tags);
         }
 
+        // Ensure _dd.appsec.enabled is present on the invocation span when AAP is enabled.
+        // complete_inferred_spans (called below) propagates this metric from the invocation
+        // span to the inferred trigger span. AppSec's process_span will set it again from the
+        // security context when it runs, but this baseline guarantees the tag is always present
+        // even when the context cannot be found at flush time.
+        if self.config.ext.serverless_appsec_enabled {
+            context
+                .invocation_span
+                .metrics
+                .entry("_dd.appsec.enabled".to_string())
+                .or_insert(1.0);
+        }
+
         self.inferrer
             .complete_inferred_spans(&context.invocation_span);
 
-        // Handle cold start span if present
+        // Handle cold start span if present. Timeout handling can synthesize an
+        // invocation trace ID even when no tracer is installed; that must not
+        // make the cold start span sendable. Node/Python load spans set the
+        // cold start trace ID directly via set_cold_start_span_trace_id.
         if let Some(cold_start_span) = &mut context.cold_start_span
             && context.invocation_span.trace_id != 0
+            && tracer_detected
         {
             cold_start_span.trace_id = context.invocation_span.trace_id;
             cold_start_span.parent_id = context.invocation_span.parent_id;
@@ -604,9 +686,17 @@ impl Processor {
         trace_sender: &Arc<SendingTraceProcessor>,
         context: Context,
     ) {
+        // Capture before `get_ctx_spans` consumes `context`.
+        let client_computed_stats = context.client_computed_stats;
         let (traces, body_size) = self.get_ctx_spans(context);
-        self.send_spans(traces, body_size, tags_provider, trace_sender)
-            .await;
+        self.send_spans(
+            traces,
+            body_size,
+            tags_provider,
+            trace_sender,
+            client_computed_stats,
+        )
+        .await;
     }
 
     fn get_ctx_spans(&mut self, context: Context) -> (Vec<Span>, usize) {
@@ -671,7 +761,9 @@ impl Processor {
             let traces = vec![cold_start_span.clone()];
             let body_size = size_of_val(cold_start_span);
 
-            self.send_spans(traces, body_size, tags_provider, trace_sender)
+            // The cold start span is extension-generated and not tied to a tracer's stats
+            // signal, so the backend should compute its stats unless the extension does.
+            self.send_spans(traces, body_size, tags_provider, trace_sender, false)
                 .await;
         }
     }
@@ -685,8 +777,12 @@ impl Processor {
         body_size: usize,
         tags_provider: &Arc<provider::Provider>,
         trace_sender: &Arc<SendingTraceProcessor>,
+        client_computed_stats: bool,
     ) {
         // todo: figure out what to do here
+        // `client_computed_stats` is propagated from the tracer's placeholder span so the
+        // downstream `ChunkProcessor` (reused via `send_processed_traces` -> `process_traces`)
+        // stamps `_dd.compute_stats` on these extension-generated spans consistently with Path A.
         let header_tags = tracer_header_tags::TracerHeaderTags {
             lang: "",
             lang_version: "",
@@ -695,7 +791,7 @@ impl Processor {
             tracer_version: "",
             container_id: "",
             client_computed_top_level: false,
-            client_computed_stats: false,
+            client_computed_stats,
             dropped_p0_traces: 0,
             dropped_p0_spans: 0,
         };
@@ -765,6 +861,19 @@ impl Processor {
             self.enhanced_metrics
                 .set_cpu_time_enhanced_metrics(offsets.cpu_offset.clone());
         }
+
+        // Release the context now that all processing for this invocation is complete.
+        // This prevents unbounded memory growth across warm invocations.
+        self.context_buffer.remove(request_id);
+        // Prune the corresponding reparenting entry so that update_reparenting does not
+        // warn about a missing context for already-completed invocations.
+        self.context_buffer
+            .sorted_reparenting_info
+            .retain(|info| info.request_id != *request_id);
+        trace!(
+            "Context released (buffer size after remove: {})",
+            self.context_buffer.size()
+        );
     }
 
     /// Handles Managed Instance mode platform report processing.
@@ -835,25 +944,25 @@ impl Processor {
 
     /// Handles `OnDemand` mode platform report processing.
     ///
-    /// Processes OnDemand-specific metrics including OOM detection for provided.al runtimes
-    /// and post-runtime duration calculation.
+    /// Processes OnDemand-specific metrics including OOM detection by memory-size
+    /// equality and post-runtime duration calculation.
     fn handle_ondemand_report(
         &mut self,
         request_id: &String,
         metrics: OnDemandReportMetrics,
         timestamp: i64,
     ) {
-        // For provided.al runtimes, if the last invocation hit the memory limit, increment the OOM metric.
-        // We do this for provided.al runtimes because we didn't find another way to detect this under provided.al.
-        // We don't do this for other runtimes to avoid double counting.
-        if let Some(runtime) = &self.runtime
-            && runtime.starts_with("provided.al")
-            && metrics.max_memory_used_mb == metrics.memory_size_mb
-        {
+        // If the invocation hit the memory limit, increment the OOM metric. This catches
+        // OOM-induced failures that don't surface through a runtime-specific log line or a
+        // `Runtime.OutOfMemory` error_type — most notably the suppressed-init / timeout-at-cap
+        // pattern reported in datadog-lambda-extension#1237 (Node). Best-effort dedup
+        // against the other two detection paths is handled by `try_increment_oom_metric`
+        // (it can still double-count in edge cases — see that function's doc).
+        if metrics.max_memory_used_mb == metrics.memory_size_mb {
             debug!(
                 "Invocation Processor | PlatformReport | Last invocation hit memory limit. Incrementing OOM metric."
             );
-            self.enhanced_metrics.increment_oom_metric(timestamp);
+            self.try_increment_oom_metric(Some(request_id), timestamp);
         }
 
         // Calculate and set post-runtime duration if context is available
@@ -863,6 +972,20 @@ impl Processor {
             let post_runtime_duration_ms = metrics.duration_ms - context.runtime_duration_ms;
             self.enhanced_metrics
                 .set_post_runtime_duration_metric(post_runtime_duration_ms, timestamp);
+        }
+
+        // Fallback for the init duration metric. The `platform.initReport` event is the primary source for the init duration metric,
+        // but in case it does not arrive / arrives late, we fall back to the `init_duration_ms` field on `platform.report`.
+        // If the init duration metric has already been emitted on the init report event, we skip emitting the metric here, to prevent double counting.
+        if !self.init_duration_metric_emitted
+            && let Some(init_duration_ms) = metrics.init_duration_ms
+        {
+            self.enhanced_metrics.set_init_duration_metric(
+                InitType::OnDemand,
+                init_duration_ms,
+                timestamp,
+            );
+            self.init_duration_metric_emitted = true;
         }
     }
 
@@ -896,40 +1019,42 @@ impl Processor {
 
         self.inferrer.infer_span(&payload_value, &self.aws_config);
 
-        // MANAGED INSTANCE MODE: Use request ID-based pairing for concurrent invocations
-        if self.aws_config.is_managed_instance_mode() {
-            if let Some(req_id) = request_id {
+        // Both modes: use request_id-based pairing when the tracer sends the header.
+        if let Some(req_id) = request_id {
+            debug!(
+                "Processing UniversalInstrumentationStart for request_id: {}",
+                req_id
+            );
+            if self
+                .context_buffer
+                .pair_universal_instrumentation_start_with_request_id(
+                    &req_id,
+                    &headers,
+                    &payload_value,
+                )
+            {
+                // Invoke event already happened, process immediately
+                self.process_on_universal_instrumentation_start(req_id, headers, payload_value);
+            } else {
+                // Buffered for later pairing when Invoke event arrives
                 debug!(
-                    "Managed Instance: Processing UniversalInstrumentationStart for request_id: {}",
+                    "Buffered UniversalInstrumentationStart for request_id: {}",
                     req_id
                 );
-                if self
-                    .context_buffer
-                    .pair_universal_instrumentation_start_with_request_id(
-                        &req_id,
-                        &headers,
-                        &payload_value,
-                    )
-                {
-                    // Invoke event already happened, process immediately
-                    self.process_on_universal_instrumentation_start(req_id, headers, payload_value);
-                } else {
-                    // Buffered for later pairing when Invoke event arrives
-                    debug!(
-                        "Managed Instance: Buffered UniversalInstrumentationStart for request_id: {}",
-                        req_id
-                    );
-                }
-                return;
             }
-            // Missing request_id in managed instance mode - log warning and fall back to FIFO
+            return;
+        }
+
+        // Missing request_id: warn in Managed Instance mode (concurrent invocations make FIFO
+        // unsafe), fall back to FIFO for on-demand.
+        if self.aws_config.is_managed_instance_mode() {
             warn!(
                 "Managed Instance: UniversalInstrumentationStart missing request_id header. \
                 Falling back to FIFO pairing (may cause incorrect pairing with concurrent invocations)"
             );
         }
 
-        // ON-DEMAND MODE: Use existing FIFO pairing logic (unchanged)
+        // ON-DEMAND MODE FIFO fallback: for tracers that do not send request_id headers.
         if let Some(request_id) = self
             .context_buffer
             .pair_universal_instrumentation_start_event(&headers, &payload_value)
@@ -950,12 +1075,12 @@ impl Processor {
         };
 
         // Tag the invocation span with the request payload
-        if self.config.capture_lambda_payload {
+        if self.config.ext.capture_lambda_payload {
             let metadata = get_metadata_from_value(
                 "function.request",
                 &payload_value,
                 0,
-                self.config.capture_lambda_payload_max_depth,
+                self.config.ext.capture_lambda_payload_max_depth,
             );
             context.invocation_span.meta.extend(metadata);
         }
@@ -965,7 +1090,10 @@ impl Processor {
 
         // Set the extracted trace context to the spans
         if let Some(sc) = &context.extracted_span_context {
-            context.invocation_span.trace_id = sc.trace_id;
+            #[allow(clippy::cast_possible_truncation)] // Datadog protocol uses lower 64 bits
+            {
+                context.invocation_span.trace_id = sc.trace_id as u64;
+            }
             context.invocation_span.parent_id = sc.span_id;
 
             // Set the right data to the correct root level span,
@@ -1068,7 +1196,7 @@ impl Processor {
     pub fn extract_span_context(
         headers: &HashMap<String, String>,
         payload_value: &Value,
-        propagator: Arc<impl Propagator>,
+        propagator: Arc<DatadogCompositePropagator>,
     ) -> Option<SpanContext> {
         if let Some(sc) =
             span_inferrer::extract_span_context(payload_value, Arc::clone(&propagator))
@@ -1079,14 +1207,14 @@ impl Processor {
         if let Some(sc) = payload_value
             .get("request")
             .and_then(|req| req.get("headers"))
-            .and_then(|headers| propagator.extract(headers))
+            .and_then(|headers| propagator.extract(&JsonCarrier(headers)))
         {
             debug!("Extracted trace context from event.request.headers");
             return Some(sc);
         }
 
         if let Some(payload_headers) = payload_value.get("headers")
-            && let Some(sc) = propagator.extract(payload_headers)
+            && let Some(sc) = propagator.extract(&JsonCarrier(payload_headers))
         {
             debug!("Extracted trace context from event headers");
             return Some(sc);
@@ -1108,40 +1236,42 @@ impl Processor {
         payload_value: Value,
         request_id: Option<String>,
     ) {
-        // MANAGED INSTANCE MODE: Use request ID-based pairing for concurrent invocations
-        if self.aws_config.is_managed_instance_mode() {
-            if let Some(req_id) = request_id {
+        // Both modes: use request_id-based pairing when the tracer sends the header.
+        if let Some(req_id) = request_id {
+            debug!(
+                "Processing UniversalInstrumentationEnd for request_id: {}",
+                req_id
+            );
+            if self
+                .context_buffer
+                .pair_universal_instrumentation_end_with_request_id(
+                    &req_id,
+                    &headers,
+                    &payload_value,
+                )
+            {
+                // PlatformRuntimeDone already happened, process immediately
+                self.process_on_universal_instrumentation_end(req_id, headers, payload_value);
+            } else {
+                // Buffered for later pairing when PlatformRuntimeDone arrives
                 debug!(
-                    "Managed Instance: Processing UniversalInstrumentationEnd for request_id: {}",
+                    "Buffered UniversalInstrumentationEnd for request_id: {}",
                     req_id
                 );
-                if self
-                    .context_buffer
-                    .pair_universal_instrumentation_end_with_request_id(
-                        &req_id,
-                        &headers,
-                        &payload_value,
-                    )
-                {
-                    // PlatformRuntimeDone already happened, process immediately
-                    self.process_on_universal_instrumentation_end(req_id, headers, payload_value);
-                } else {
-                    // Buffered for later pairing when PlatformRuntimeDone arrives
-                    debug!(
-                        "Managed Instance: Buffered UniversalInstrumentationEnd for request_id: {}",
-                        req_id
-                    );
-                }
-                return;
             }
-            // Missing request_id in managed instance mode - log warning and fall back to FIFO
+            return;
+        }
+
+        // Missing request_id: warn in Managed Instance mode (concurrent invocations make FIFO
+        // unsafe), fall back to FIFO for on-demand.
+        if self.aws_config.is_managed_instance_mode() {
             warn!(
                 "Managed Instance: UniversalInstrumentationEnd missing request_id header. \
                 Falling back to FIFO pairing (may cause incorrect pairing with concurrent invocations)"
             );
         }
 
-        // ON-DEMAND MODE: Use existing FIFO pairing logic (unchanged)
+        // ON-DEMAND MODE FIFO fallback: for tracers that do not send request_id headers.
         // If `PlatformRuntimeDone` event happened first, process
         if let Some(request_id) = self
             .context_buffer
@@ -1163,12 +1293,12 @@ impl Processor {
         };
 
         // Tag the invocation span with the request payload
-        if self.config.capture_lambda_payload {
+        if self.config.ext.capture_lambda_payload {
             let metadata = get_metadata_from_value(
                 "function.response",
                 &payload_value,
                 0,
-                self.config.capture_lambda_payload_max_depth,
+                self.config.ext.capture_lambda_payload_max_depth,
             );
             context.invocation_span.meta.extend(metadata);
         }
@@ -1188,14 +1318,17 @@ impl Processor {
             self.inferrer.set_status_code(status_code_as_string);
         }
 
-        let mut trace_id = 0;
-        let mut parent_id = 0;
+        let mut trace_id: u64 = 0;
+        let mut parent_id: u64 = 0;
         let mut tags: HashMap<String, String> = HashMap::new();
 
         // If we have a trace context, this means we got it from
         // distributed tracing
         if let Some(sc) = &context.extracted_span_context {
-            trace_id = sc.trace_id;
+            #[allow(clippy::cast_possible_truncation)] // Datadog protocol uses lower 64 bits
+            {
+                trace_id = sc.trace_id as u64;
+            }
             parent_id = sc.span_id;
             tags.extend(sc.tags.clone());
         }
@@ -1221,9 +1354,9 @@ impl Processor {
                     .insert(TAG_SAMPLING_PRIORITY.to_string(), priority);
             }
 
-            // Extract tags from headers
-            // Used for 128 bit trace ids
-            tags = DatadogHeaderPropagator::extract_tags(&headers);
+            // Extract _dd.p.* propagation tags from x-datadog-tags header
+            let carrier_tags = headers.get(DATADOG_TAGS_KEY).map_or("", String::as_str);
+            tags = crate::traces::propagation::extract_propagation_tags(carrier_tags);
         }
 
         // We should always use the generated span id from the tracer
@@ -1315,7 +1448,52 @@ impl Processor {
         Some(error_tags)
     }
 
-    pub fn on_out_of_memory_error(&mut self, timestamp: i64) {
+    pub fn on_out_of_memory_error(&mut self, request_id: Option<&String>, timestamp: i64) {
+        self.try_increment_oom_metric(request_id, timestamp);
+    }
+
+    /// Best-effort dedup wrapper around `enhanced_metrics.increment_oom_metric`.
+    /// The metric MAY be double-counted in edge cases — see below.
+    ///
+    /// Several detection paths can fire for the same invocation:
+    /// 1. A runtime-specific OOM log line (logs processor → `Event::OutOfMemory`)
+    /// 2. `error_type == "Runtime.OutOfMemory"` in `PlatformRuntimeDone`
+    /// 3. `max_memory_used_mb == memory_size_mb` in `PlatformReport`
+    ///
+    /// When `request_id` is supplied AND the matching context is still in the
+    /// buffer, the per-invocation `Context::oom_emitted` flag guarantees one
+    /// emission per `request_id`. The metric is double-counted when either:
+    ///   - `request_id` is `None` (log line beat `PlatformStart` to
+    ///     `LambdaProcessor`, or it landed after `PlatformRuntimeDone` cleared
+    ///     the slot) and another path subsequently emits with `Some(rid)`; or
+    ///   - the context has been evicted from the buffer (capacity is fixed —
+    ///     see `MAX_CONTEXT_BUFFER_SIZE`) between `PlatformStart` and this
+    ///     call, so the flag has nowhere to live.
+    ///
+    /// Both branches still emit (so OOMs are never under-counted) and log a
+    /// `debug!` line.
+    fn try_increment_oom_metric(&mut self, request_id: Option<&String>, timestamp: i64) {
+        if let Some(rid) = request_id {
+            if let Some(ctx) = self.context_buffer.get_mut(rid) {
+                if ctx.oom_emitted {
+                    debug!(
+                        "Invocation Processor | OOM metric already emitted for request_id {}, skipping",
+                        rid
+                    );
+                    return;
+                }
+                ctx.oom_emitted = true;
+            } else {
+                debug!(
+                    "Invocation Processor | Emitting OOM metric without dedup: context not found for request_id {} (likely evicted from context buffer)",
+                    rid
+                );
+            }
+        } else {
+            debug!(
+                "Invocation Processor | Emitting OOM metric without dedup: no request_id available (OOM log processed before PlatformStart or after PlatformRuntimeDone)"
+            );
+        }
         self.enhanced_metrics.increment_oom_metric(timestamp);
     }
 
@@ -1323,9 +1501,35 @@ impl Processor {
     ///
     /// This is used to enrich the invocation span with additional metadata from the tracers
     /// top level span, since we discard the tracer span when we create the invocation span.
-    pub fn add_tracer_span(&mut self, span: &Span) {
+    pub fn add_tracer_span(&mut self, span: &Span, client_computed_stats: bool) {
         if let Some(request_id) = span.meta.get("request_id") {
-            self.context_buffer.add_tracer_span(request_id, span);
+            self.context_buffer
+                .add_tracer_span(request_id, span, client_computed_stats);
+        }
+    }
+
+    /// Forwards durable execution context extracted from an `aws.lambda` span to the logs
+    /// pipeline so it can release held logs and tag them with durable execution metadata.
+    pub async fn forward_durable_context(
+        &mut self,
+        request_id: &str,
+        execution_id: &str,
+        execution_name: &str,
+        first_invocation: Option<bool>,
+        execution_status: Option<String>,
+    ) {
+        if let Err(e) = self
+            .durable_context_tx
+            .send(DurableContextUpdate {
+                request_id: request_id.to_owned(),
+                execution_id: execution_id.to_owned(),
+                execution_name: execution_name.to_owned(),
+                first_invocation,
+                execution_status,
+            })
+            .await
+        {
+            error!("Invocation Processor | Failed to forward durable context to logs agent: {e}");
         }
     }
 }
@@ -1340,7 +1544,7 @@ mod tests {
     use crate::traces::stats_generator::StatsGenerator;
     use crate::traces::trace_processor;
     use base64::{Engine, engine::general_purpose::STANDARD};
-    use dogstatsd::aggregator_service::AggregatorService;
+    use dogstatsd::aggregator::AggregatorService;
     use dogstatsd::metric::EMPTY_TAGS;
     use serde_json::json;
 
@@ -1373,7 +1577,15 @@ mod tests {
         tokio::spawn(service.run());
 
         let propagator = Arc::new(DatadogCompositePropagator::new(Arc::clone(&config)));
-        Processor::new(tags_provider, config, aws_config, handle, propagator)
+        let (durable_context_tx, _) = tokio::sync::mpsc::channel(1);
+        Processor::new(
+            tags_provider,
+            config,
+            aws_config,
+            handle,
+            propagator,
+            durable_context_tx,
+        )
     }
 
     #[test]
@@ -1606,8 +1818,7 @@ mod tests {
                         duration_ms,
                         status,
                         error_type,
-                        should_have_context_after,
-                    ): (&str, bool, f64, Status, Option<String>, bool) = $value;
+                    ): (&str, bool, f64, Status, Option<String>) = $value;
 
                     let mut processor = setup();
 
@@ -1649,6 +1860,17 @@ mod tests {
                         stats_generator: Arc::new(StatsGenerator::new(stats_concentrator_handle)),
                     });
 
+                    // Verify context state before on_platform_report
+                    let request_id_string_for_get = request_id.to_string();
+                    assert_eq!(
+                        processor.context_buffer.get(&request_id_string_for_get).is_some(),
+                        // Use setup_context because it dictates whether the request is handled up front,
+                        // which in turn signals whether the request is valid/processed.
+                        setup_context,
+                        "Context existence mismatch for request_id: {}",
+                        request_id
+                    );
+
                     // Call on_platform_report
                     let request_id_string = request_id.to_string();
                     processor.on_platform_report(
@@ -1666,7 +1888,7 @@ mod tests {
                     let request_id_string_for_get = request_id.to_string();
                     assert_eq!(
                         processor.context_buffer.get(&request_id_string_for_get).is_some(),
-                        should_have_context_after,
+                        false,
                         "Context existence mismatch for request_id: {}",
                         request_id
                     );
@@ -1676,14 +1898,13 @@ mod tests {
     }
 
     platform_report_managed_instance_tests! {
-        // (request_id, setup_context, duration_ms, status, error_type, should_have_context_after)
+        // (request_id, setup_context, duration_ms, status, error_type)
         test_on_platform_report_managed_instance_mode_with_valid_context: (
             "test-request-id",
             true,  // setup context
             123.45,
             Status::Success,
             None,
-            true,  // context should still exist
         ),
 
         test_on_platform_report_managed_instance_mode_without_context: (
@@ -1692,7 +1913,6 @@ mod tests {
             123.45,
             Status::Success,
             None,
-            false, // context should not exist
         ),
 
         test_on_platform_report_managed_instance_mode_with_error_status: (
@@ -1701,7 +1921,6 @@ mod tests {
             200.0,
             Status::Error,
             Some("RuntimeError".to_string()),
-            true,  // context should still exist
         ),
 
         test_on_platform_report_managed_instance_mode_with_timeout: (
@@ -1710,8 +1929,341 @@ mod tests {
             30000.0,
             Status::Timeout,
             None,
-            true,  // context should still exist
         ),
+    }
+
+    #[tokio::test]
+    async fn test_context_removed_after_on_platform_report_on_demand() {
+        use libdd_trace_obfuscation::obfuscation_config::ObfuscationConfig;
+
+        let mut p = setup();
+        let request_id = String::from("test-request-id");
+
+        p.on_invoke_event(request_id.clone());
+        let start_time = chrono::Utc::now();
+        p.on_platform_start(request_id.clone(), start_time);
+        assert!(
+            p.context_buffer.get(&request_id).is_some(),
+            "context must exist before report"
+        );
+
+        let config = Arc::new(config::Config {
+            service: Some("test-service".to_string()),
+            ..config::Config::default()
+        });
+        let tags_provider = Arc::new(provider::Provider::new(
+            Arc::clone(&config),
+            LAMBDA_RUNTIME_SLUG.to_string(),
+            &HashMap::from([("function_arn".to_string(), "test-arn".to_string())]),
+        ));
+        let (stats_concentrator_service, stats_concentrator_handle) =
+            StatsConcentratorService::new(Arc::clone(&config));
+        tokio::spawn(stats_concentrator_service.run());
+        let trace_sender = Arc::new(SendingTraceProcessor {
+            appsec: None,
+            processor: Arc::new(trace_processor::ServerlessTraceProcessor {
+                obfuscation_config: Arc::new(
+                    ObfuscationConfig::new().expect("Failed to create ObfuscationConfig"),
+                ),
+            }),
+            trace_tx: tokio::sync::mpsc::channel(1).0,
+            stats_generator: Arc::new(StatsGenerator::new(stats_concentrator_handle)),
+        });
+
+        p.on_platform_report(
+            &request_id,
+            ReportMetrics::OnDemand(OnDemandReportMetrics {
+                duration_ms: 123.45,
+                billed_duration_ms: 124,
+                memory_size_mb: 256,
+                max_memory_used_mb: 128,
+                init_duration_ms: None,
+                restore_duration_ms: None,
+            }),
+            chrono::Utc::now().timestamp(),
+            Status::Success,
+            None,
+            None,
+            tags_provider,
+            trace_sender,
+        )
+        .await;
+
+        assert!(
+            p.context_buffer.get(&request_id).is_none(),
+            "context must be removed after on_platform_report completes"
+        );
+        assert_eq!(p.context_buffer.size(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_on_platform_init_start_sets_durable_function_tag() {
+        let mut processor = setup();
+        let time = Utc::now();
+
+        processor.on_platform_init_start(time, Some("python:3.14.DurableFunction.v6".to_string()));
+
+        let now: i64 = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("unable to poll clock, unrecoverable")
+            .as_secs()
+            .try_into()
+            .unwrap_or_default();
+        processor.enhanced_metrics.increment_invocation_metric(now);
+
+        let ts = (now / 10) * 10;
+        let durable_tags = dogstatsd::metric::SortedTags::parse("durable_function:true").ok();
+        let entry = processor
+            .enhanced_metrics
+            .aggr_handle
+            .get_entry_by_id(
+                crate::metrics::enhanced::constants::INVOCATIONS_METRIC.into(),
+                durable_tags,
+                ts,
+            )
+            .await
+            .unwrap();
+        assert!(
+            entry.is_some(),
+            "Expected durable_function:true tag on enhanced metric"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_platform_init_start_no_durable_function_tag_for_regular_runtime() {
+        let mut processor = setup();
+        let time = Utc::now();
+
+        processor.on_platform_init_start(time, Some("python:3.12.v10".to_string()));
+
+        let now: i64 = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("unable to poll clock, unrecoverable")
+            .as_secs()
+            .try_into()
+            .unwrap_or_default();
+        processor.enhanced_metrics.increment_invocation_metric(now);
+
+        let ts = (now / 10) * 10;
+        let durable_tags = dogstatsd::metric::SortedTags::parse("durable_function:true").ok();
+        let entry = processor
+            .enhanced_metrics
+            .aggr_handle
+            .get_entry_by_id(
+                crate::metrics::enhanced::constants::INVOCATIONS_METRIC.into(),
+                durable_tags,
+                ts,
+            )
+            .await
+            .unwrap();
+        assert!(
+            entry.is_none(),
+            "Expected no durable_function:true tag for regular runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_on_platform_init_start_no_durable_function_tag_when_runtime_version_is_none() {
+        let mut processor = setup();
+        let time = Utc::now();
+
+        processor.on_platform_init_start(time, None);
+
+        let now: i64 = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("unable to poll clock, unrecoverable")
+            .as_secs()
+            .try_into()
+            .unwrap_or_default();
+        processor.enhanced_metrics.increment_invocation_metric(now);
+
+        let ts = (now / 10) * 10;
+        let durable_tags = dogstatsd::metric::SortedTags::parse("durable_function:true").ok();
+        let entry = processor
+            .enhanced_metrics
+            .aggr_handle
+            .get_entry_by_id(
+                crate::metrics::enhanced::constants::INVOCATIONS_METRIC.into(),
+                durable_tags,
+                ts,
+            )
+            .await
+            .unwrap();
+        assert!(
+            entry.is_none(),
+            "Expected no durable_function:true tag when runtime_version is None"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_init_duration_emitted_from_init_report() {
+        let mut processor = setup();
+        let timestamp = 1_000_000_i64;
+
+        // Processor receives the platform init report event
+        processor.on_platform_init_report(InitType::OnDemand, 200.0, timestamp);
+
+        // Check that the init duration metric was inserted into the aggregator
+        let tags = dogstatsd::metric::SortedTags::parse("init_type:on-demand").ok();
+        let entry = processor
+            .enhanced_metrics
+            .aggr_handle
+            .get_entry_by_id(
+                crate::metrics::enhanced::constants::INIT_DURATION_METRIC.into(),
+                tags,
+                timestamp,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            entry.is_some(),
+            "init duration should be emitted when platform.initReport is received"
+        );
+
+        // Check that the init duration metric emitted flag is set to true
+        assert!(
+            processor.init_duration_metric_emitted,
+            "init duration metric emitted flag should be set to true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_init_duration_emitted_from_report() {
+        let mut processor = setup();
+        let timestamp = 1_000_000_i64;
+        let report_metrics = OnDemandReportMetrics {
+            duration_ms: 100.0,
+            billed_duration_ms: 100,
+            memory_size_mb: 128,
+            max_memory_used_mb: 50,
+            init_duration_ms: Some(200.0), // init duration is present in the report on a cold start invocation
+            restore_duration_ms: None,
+        };
+
+        // Processor receives the platform report event
+        // This should set the init duration metric as the processor is initalized
+        // with init_duration_metric_emitted set to false
+        processor.handle_ondemand_report(&"req-1".to_string(), report_metrics, timestamp);
+
+        // Check that the init duration metric was inserted into the aggregator
+        let tags = dogstatsd::metric::SortedTags::parse("init_type:on-demand").ok();
+        let entry = processor
+            .enhanced_metrics
+            .aggr_handle
+            .get_entry_by_id(
+                crate::metrics::enhanced::constants::INIT_DURATION_METRIC.into(),
+                tags,
+                timestamp,
+            )
+            .await
+            .unwrap();
+        assert!(
+            entry.is_some(),
+            "init duration should be emitted from the report fallback"
+        );
+
+        // Check that the init duration metric emitted flag is set to true
+        assert!(
+            processor.init_duration_metric_emitted,
+            "init duration metric emitted flag should be set to true"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_init_duration_not_emitted_for_warm_invocation_report() {
+        let mut processor = setup();
+        let timestamp = 1_000_000_i64;
+        let report_metrics = OnDemandReportMetrics {
+            duration_ms: 100.0,
+            billed_duration_ms: 100,
+            memory_size_mb: 128,
+            max_memory_used_mb: 50,
+            init_duration_ms: None, // init duration is None for a non-cold start invocation
+            restore_duration_ms: None,
+        };
+
+        // A warm invocation has no init_duration_ms, so nothing should be emitted
+        processor.handle_ondemand_report(&"req-1".to_string(), report_metrics, timestamp);
+
+        // Check that an init duration metric was NOT inserted into the aggregator
+        assert!(!processor.init_duration_metric_emitted);
+        let tags = dogstatsd::metric::SortedTags::parse("init_type:on-demand").ok();
+        let entry = processor
+            .enhanced_metrics
+            .aggr_handle
+            .get_entry_by_id(
+                crate::metrics::enhanced::constants::INIT_DURATION_METRIC.into(),
+                tags,
+                timestamp,
+            )
+            .await
+            .unwrap();
+        assert!(
+            entry.is_none(),
+            "no init duration metric should be inserted on a warm report"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_report_does_not_re_emit_init_duration_after_init_report() {
+        let mut processor = setup();
+        // Give the init report and the platform report different timestamps so they fall in different aggregation buckets
+        let init_report_timestamp = 1_000_000_i64;
+        let platform_report_timestamp = 1_000_100_i64;
+        let report_metrics = OnDemandReportMetrics {
+            duration_ms: 100.0,
+            billed_duration_ms: 100,
+            memory_size_mb: 128,
+            max_memory_used_mb: 50,
+            init_duration_ms: Some(200.0), // init duration is present in the report on a cold start invocation
+            restore_duration_ms: None,
+        };
+
+        // Processor receives the platform init report event, which emits the init duration metric.
+        processor.on_platform_init_report(InitType::OnDemand, 200.0, init_report_timestamp);
+
+        // Processor then receives the platform report event; the fallback must not emit again.
+        processor.handle_ondemand_report(
+            &"req-1".to_string(),
+            report_metrics,
+            platform_report_timestamp,
+        );
+
+        // Filter for metrics with the "on-demand" init type
+        let on_demand = dogstatsd::metric::SortedTags::parse("init_type:on-demand").ok();
+
+        // Check that the init duration metric was emitted with the init report timestamp
+        let from_init_report = processor
+            .enhanced_metrics
+            .aggr_handle
+            .get_entry_by_id(
+                crate::metrics::enhanced::constants::INIT_DURATION_METRIC.into(),
+                on_demand.clone(),
+                init_report_timestamp,
+            )
+            .await
+            .unwrap();
+        assert!(
+            from_init_report.is_some(),
+            "platform.initReport should have emitted the init duration metric"
+        );
+
+        // Check that the init duration metric was not also emitted with the platform report timestamp
+        let from_report = processor
+            .enhanced_metrics
+            .aggr_handle
+            .get_entry_by_id(
+                crate::metrics::enhanced::constants::INIT_DURATION_METRIC.into(),
+                on_demand,
+                platform_report_timestamp,
+            )
+            .await
+            .unwrap();
+        assert!(
+            from_report.is_none(),
+            "platform.report should not emit a second init duration metric after platform.initReport"
+        );
     }
 
     #[tokio::test]
@@ -1741,7 +2293,15 @@ mod tests {
 
         let propagator = Arc::new(DatadogCompositePropagator::new(Arc::clone(&config)));
 
-        let processor = Processor::new(tags_provider, config, aws_config, handle, propagator);
+        let (durable_context_tx, _) = tokio::sync::mpsc::channel(1);
+        let processor = Processor::new(
+            tags_provider,
+            config,
+            aws_config,
+            handle,
+            propagator,
+            durable_context_tx,
+        );
 
         assert!(
             processor.is_managed_instance_mode(),
@@ -1865,8 +2425,8 @@ mod tests {
     fn test_extract_span_context_priority_order() {
         let config = Arc::new(config::Config {
             trace_propagation_style_extract: vec![
-                config::trace_propagation_style::TracePropagationStyle::Datadog,
-                config::trace_propagation_style::TracePropagationStyle::TraceContext,
+                datadog_opentelemetry::propagation::TracePropagationStyle::Datadog,
+                datadog_opentelemetry::propagation::TracePropagationStyle::TraceContext,
             ],
             ..config::Config::default()
         });
@@ -1903,8 +2463,8 @@ mod tests {
     fn test_extract_span_context_no_request_headers() {
         let config = Arc::new(config::Config {
             trace_propagation_style_extract: vec![
-                config::trace_propagation_style::TracePropagationStyle::Datadog,
-                config::trace_propagation_style::TracePropagationStyle::TraceContext,
+                datadog_opentelemetry::propagation::TracePropagationStyle::Datadog,
+                datadog_opentelemetry::propagation::TracePropagationStyle::TraceContext,
             ],
             ..config::Config::default()
         });
@@ -1926,5 +2486,610 @@ mod tests {
             result.is_none(),
             "Should return None when no trace context found"
         );
+    }
+
+    fn make_trace_sender(config: Arc<config::Config>) -> Arc<SendingTraceProcessor> {
+        use libdd_trace_obfuscation::obfuscation_config::ObfuscationConfig;
+        let (stats_concentrator_service, stats_concentrator_handle) =
+            StatsConcentratorService::new(Arc::clone(&config));
+        tokio::spawn(stats_concentrator_service.run());
+        Arc::new(SendingTraceProcessor {
+            appsec: None,
+            processor: Arc::new(trace_processor::ServerlessTraceProcessor {
+                obfuscation_config: Arc::new(
+                    ObfuscationConfig::new().expect("Failed to create ObfuscationConfig"),
+                ),
+            }),
+            trace_tx: tokio::sync::mpsc::channel(1).0,
+            stats_generator: Arc::new(StatsGenerator::new(stats_concentrator_handle)),
+        })
+    }
+
+    // Regression test for SLES-2810: sorted_reparenting_info must be pruned when the
+    // context is released in on_platform_report, so that update_reparenting does not
+    // emit spurious warnings for already-completed invocations.
+    #[tokio::test]
+    async fn test_reparenting_info_pruned_after_on_platform_report() {
+        let mut p = setup();
+        let request_id = String::from("test-request-id");
+
+        p.on_invoke_event(request_id.clone());
+        p.add_reparenting(request_id.clone(), 42, 0);
+        assert_eq!(
+            p.context_buffer.sorted_reparenting_info.len(),
+            1,
+            "reparenting entry must exist before report"
+        );
+
+        let config = Arc::new(config::Config::default());
+        let tags_provider = Arc::new(provider::Provider::new(
+            Arc::clone(&config),
+            LAMBDA_RUNTIME_SLUG.to_string(),
+            &HashMap::from([("function_arn".to_string(), "test-arn".to_string())]),
+        ));
+        let trace_sender = make_trace_sender(config);
+
+        p.on_platform_report(
+            &request_id,
+            ReportMetrics::OnDemand(OnDemandReportMetrics {
+                duration_ms: 10.0,
+                billed_duration_ms: 11,
+                memory_size_mb: 128,
+                max_memory_used_mb: 64,
+                init_duration_ms: None,
+                restore_duration_ms: None,
+            }),
+            chrono::Utc::now().timestamp(),
+            Status::Success,
+            None,
+            None,
+            tags_provider,
+            trace_sender,
+        )
+        .await;
+
+        assert!(
+            p.context_buffer.sorted_reparenting_info.is_empty(),
+            "reparenting entry must be pruned after on_platform_report"
+        );
+    }
+
+    // Regression test for SLES-2810: update_reparenting must not visit stale entries
+    // whose context has already been released, preventing the warning flood.
+    #[tokio::test]
+    async fn test_update_reparenting_ignores_completed_invocations() {
+        let mut p = setup();
+
+        // Invocation A completes fully.
+        let request_id_a = String::from("request-a");
+        p.on_invoke_event(request_id_a.clone());
+        p.add_reparenting(request_id_a.clone(), 11, 0);
+
+        let config = Arc::new(config::Config::default());
+        let tags_provider = Arc::new(provider::Provider::new(
+            Arc::clone(&config),
+            LAMBDA_RUNTIME_SLUG.to_string(),
+            &HashMap::from([("function_arn".to_string(), "test-arn".to_string())]),
+        ));
+        let trace_sender = make_trace_sender(Arc::clone(&config));
+
+        p.on_platform_report(
+            &request_id_a,
+            ReportMetrics::OnDemand(OnDemandReportMetrics {
+                duration_ms: 10.0,
+                billed_duration_ms: 11,
+                memory_size_mb: 128,
+                max_memory_used_mb: 64,
+                init_duration_ms: None,
+                restore_duration_ms: None,
+            }),
+            chrono::Utc::now().timestamp(),
+            Status::Success,
+            None,
+            None,
+            tags_provider,
+            trace_sender,
+        )
+        .await;
+
+        // Invocation B is in-flight (context still live).
+        let request_id_b = String::from("request-b");
+        p.on_invoke_event(request_id_b.clone());
+        p.add_reparenting(request_id_b.clone(), 22, 0);
+
+        // Simulate the trace agent path: clone reparenting_info, then call update_reparenting.
+        // Before the fix this clone contained the stale entry for request-a, causing a warning.
+        let reparenting_info = p.get_reparenting_info();
+
+        // Only the live invocation B should be present.
+        assert_eq!(
+            reparenting_info.len(),
+            1,
+            "only the in-flight invocation must remain in reparenting_info"
+        );
+        assert_eq!(reparenting_info[0].request_id, request_id_b);
+
+        // update_reparenting must return no contexts to send (span IDs still unset).
+        let ctx_to_send = p.update_reparenting(reparenting_info);
+        assert!(
+            ctx_to_send.is_empty(),
+            "no contexts should be ready to send yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_without_tracer_does_not_send_cold_start_span() {
+        let mut p = setup();
+        let request_id = String::from("timeout-no-tracer");
+        let mut cold_start_span = create_empty_span(
+            "aws.lambda.cold_start".to_string(),
+            "test-resource",
+            "test-service",
+        );
+        cold_start_span.span_id = 42;
+
+        p.context_buffer.start_context(&request_id, Span::default());
+        p.context_buffer
+            .get_mut(&request_id)
+            .expect("context must exist")
+            .cold_start_span = Some(cold_start_span);
+
+        let config = Arc::clone(&p.config);
+        let tags_provider = Arc::new(provider::Provider::new(
+            Arc::clone(&config),
+            LAMBDA_RUNTIME_SLUG.to_string(),
+            &HashMap::from([("function_arn".to_string(), "test-arn".to_string())]),
+        ));
+        // Keep `trace_sender` owned by the test (pass a clone) so the channel stays
+        // connected through the assertion below; otherwise try_recv would report
+        // Disconnected instead of Empty.
+        let (trace_sender, mut trace_rx) = make_trace_sender_with_rx(config);
+
+        p.on_platform_runtime_done(
+            &request_id,
+            RuntimeDoneMetrics {
+                duration_ms: 100.0,
+                produced_bytes: None,
+            },
+            Status::Timeout,
+            None,
+            tags_provider,
+            Arc::clone(&trace_sender),
+            chrono::Utc::now().timestamp(),
+        )
+        .await;
+
+        let context = p
+            .context_buffer
+            .get(&request_id)
+            .expect("context must exist");
+        assert_ne!(
+            context.invocation_span.trace_id, 0,
+            "timeout handling should still give the invocation span a trace ID"
+        );
+        assert_eq!(
+            context
+                .cold_start_span
+                .as_ref()
+                .expect("cold start span must exist")
+                .trace_id,
+            0,
+            "timeout-generated trace IDs must not make cold start spans eligible to send"
+        );
+        assert!(
+            matches!(
+                trace_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "cold start span must not be sent when no tracer set its trace ID"
+        );
+        drop(trace_sender);
+    }
+
+    #[tokio::test]
+    async fn enrich_ctx_keeps_tracer_set_cold_start_trace_id_without_tracer_detected() {
+        let mut p = setup();
+        let request_id = String::from("node-python-cold-start");
+        let mut cold_start_span = create_empty_span(
+            "aws.lambda.cold_start".to_string(),
+            "test-resource",
+            "test-service",
+        );
+        cold_start_span.span_id = 42;
+        cold_start_span.trace_id = 123;
+
+        p.context_buffer.start_context(&request_id, Span::default());
+        p.context_buffer
+            .get_mut(&request_id)
+            .expect("context must exist")
+            .cold_start_span = Some(cold_start_span);
+
+        let context = p
+            .enrich_ctx_at_platform_done(&request_id, Status::Timeout)
+            .expect("context must be present");
+
+        assert_ne!(
+            context.invocation_span.trace_id, 0,
+            "timeout handling should still give the invocation span a trace ID"
+        );
+        assert_eq!(
+            context
+                .cold_start_span
+                .as_ref()
+                .expect("cold start span must exist")
+                .trace_id,
+            123,
+            "a trace ID already set from aws.lambda.load must be preserved"
+        );
+    }
+
+    fn setup_appsec() -> Processor {
+        let aws_config = Arc::new(AwsConfig {
+            region: "us-east-1".into(),
+            aws_lwa_proxy_lambda_runtime_api: Some("***".into()),
+            function_name: "test-function".into(),
+            sandbox_init_time: Instant::now(),
+            runtime_api: "***".into(),
+            exec_wrapper: None,
+            initialization_type: "on-demand".into(),
+        });
+        let config = Arc::new(config::Config {
+            service: Some("test-service".to_string()),
+            ext: config::LambdaConfig {
+                serverless_appsec_enabled: true,
+                ..Default::default()
+            },
+            ..config::Config::default()
+        });
+        let tags_provider = Arc::new(provider::Provider::new(
+            Arc::clone(&config),
+            LAMBDA_RUNTIME_SLUG.to_string(),
+            &HashMap::from([("function_arn".to_string(), "test-arn".to_string())]),
+        ));
+        let (service, handle) =
+            dogstatsd::aggregator::AggregatorService::new(dogstatsd::metric::EMPTY_TAGS, 1024)
+                .expect("failed to create aggregator service");
+        tokio::spawn(service.run());
+        let propagator = Arc::new(DatadogCompositePropagator::new(Arc::clone(&config)));
+        let (durable_context_tx, _) = tokio::sync::mpsc::channel(1);
+        Processor::new(
+            tags_provider,
+            config,
+            aws_config,
+            handle,
+            propagator,
+            durable_context_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn enrich_ctx_sets_appsec_enabled_when_aap_enabled() {
+        let mut p = setup_appsec();
+        let request_id = String::from("req-appsec");
+        p.on_invoke_event(request_id.clone());
+        p.on_platform_start(request_id.clone(), chrono::Utc::now());
+
+        let ctx = p
+            .enrich_ctx_at_platform_done(&request_id, Status::Success)
+            .expect("context must be present");
+
+        assert_eq!(
+            ctx.invocation_span.metrics.get("_dd.appsec.enabled"),
+            Some(&1.0),
+            "_dd.appsec.enabled must be 1.0 when AAP is enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_ctx_does_not_set_appsec_enabled_when_aap_disabled() {
+        let mut p = setup();
+        let request_id = String::from("req-no-appsec");
+        p.on_invoke_event(request_id.clone());
+        p.on_platform_start(request_id.clone(), chrono::Utc::now());
+
+        let ctx = p
+            .enrich_ctx_at_platform_done(&request_id, Status::Success)
+            .expect("context must be present");
+
+        assert!(
+            !ctx.invocation_span
+                .metrics
+                .contains_key("_dd.appsec.enabled"),
+            "_dd.appsec.enabled must not be set when AAP is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_ctx_does_not_override_existing_appsec_enabled() {
+        let mut p = setup_appsec();
+        let request_id = String::from("req-appsec-preset");
+        p.on_invoke_event(request_id.clone());
+        p.on_platform_start(request_id.clone(), chrono::Utc::now());
+
+        // Pre-set a different value to verify or_insert does not overwrite it.
+        p.context_buffer
+            .get_mut(&request_id)
+            .expect("context must exist")
+            .invocation_span
+            .metrics
+            .insert("_dd.appsec.enabled".to_string(), 0.0);
+
+        let ctx = p
+            .enrich_ctx_at_platform_done(&request_id, Status::Success)
+            .expect("context must be present");
+
+        assert_eq!(
+            ctx.invocation_span.metrics.get("_dd.appsec.enabled"),
+            Some(&0.0),
+            "pre-existing _dd.appsec.enabled value must not be overwritten"
+        );
+    }
+
+    /// Two OOM signals for the same `request_id` increment the metric exactly once.
+    /// Exercises the `Context::oom_emitted` dedup flag.
+    #[tokio::test]
+    async fn test_try_increment_oom_metric_dedupes_same_request_id() {
+        let mut p = setup();
+        // Insert the context directly so we don't go through `on_invoke_event`, which
+        // would populate dynamic tags (`cold_start:true`) and complicate the query.
+        let request_id = String::from("req-dedup");
+        p.context_buffer.start_context(&request_id, Span::default());
+
+        let now: i64 = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("clock")
+            .as_secs()
+            .try_into()
+            .unwrap_or_default();
+
+        p.on_out_of_memory_error(Some(&request_id), now);
+        p.on_out_of_memory_error(Some(&request_id), now);
+
+        let ts = (now / 10) * 10;
+        let entry = p
+            .enhanced_metrics
+            .aggr_handle
+            .get_entry_by_id(
+                crate::metrics::enhanced::constants::OUT_OF_MEMORY_METRIC.into(),
+                None,
+                ts,
+            )
+            .await
+            .unwrap()
+            .expect("OOM metric must be emitted at least once");
+
+        let sketch = entry.value.get_sketch().expect("distribution sketch");
+        let sum = sketch.sum().expect("sketch sum");
+        assert!(
+            (sum - 1.0).abs() < f64::EPSILON,
+            "OOM sum must be 1.0 (deduped), got {sum}"
+        );
+
+        // And the context flag should now reflect that we emitted.
+        assert!(
+            p.context_buffer
+                .get(&request_id)
+                .expect("context")
+                .oom_emitted,
+            "oom_emitted flag must be set after the first emission"
+        );
+    }
+
+    /// OOM signals for different `request_id`s each emit a metric — dedup is scoped
+    /// per request, not globally.
+    #[tokio::test]
+    async fn test_try_increment_oom_metric_distinct_request_ids_emit_separately() {
+        let mut p = setup();
+        let req1 = String::from("req-a");
+        let req2 = String::from("req-b");
+        p.context_buffer.start_context(&req1, Span::default());
+        p.context_buffer.start_context(&req2, Span::default());
+
+        let now: i64 = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("clock")
+            .as_secs()
+            .try_into()
+            .unwrap_or_default();
+
+        p.on_out_of_memory_error(Some(&req1), now);
+        p.on_out_of_memory_error(Some(&req2), now);
+
+        let ts = (now / 10) * 10;
+        let entry = p
+            .enhanced_metrics
+            .aggr_handle
+            .get_entry_by_id(
+                crate::metrics::enhanced::constants::OUT_OF_MEMORY_METRIC.into(),
+                None,
+                ts,
+            )
+            .await
+            .unwrap()
+            .expect("OOM metric must be emitted");
+
+        let sketch = entry.value.get_sketch().expect("distribution sketch");
+        let sum = sketch.sum().expect("sketch sum");
+        assert!(
+            (sum - 2.0).abs() < f64::EPSILON,
+            "OOM sum must be 2.0 (one per request_id), got {sum}"
+        );
+    }
+
+    /// In `handle_ondemand_report`, when `max_memory_used_mb == memory_size_mb`,
+    /// the OOM metric should be incremented exactly once for that invocation.
+    #[tokio::test]
+    async fn test_handle_ondemand_report_emits_oom_on_memory_equality() {
+        let mut p = setup();
+        let request_id = String::from("req-eq");
+        p.context_buffer.start_context(&request_id, Span::default());
+
+        let now: i64 = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("clock")
+            .as_secs()
+            .try_into()
+            .unwrap_or_default();
+
+        let metrics = OnDemandReportMetrics {
+            duration_ms: 100.0,
+            billed_duration_ms: 100,
+            memory_size_mb: 1024,
+            max_memory_used_mb: 1024,
+            init_duration_ms: None,
+            restore_duration_ms: None,
+        };
+        p.handle_ondemand_report(&request_id, metrics, now);
+
+        let ts = (now / 10) * 10;
+        assert!(
+            p.enhanced_metrics
+                .aggr_handle
+                .get_entry_by_id(
+                    crate::metrics::enhanced::constants::OUT_OF_MEMORY_METRIC.into(),
+                    None,
+                    ts
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "OOM must be emitted when max_memory_used_mb == memory_size_mb"
+        );
+    }
+
+    /// Build a [`Processor`] with a caller-supplied config (for toggling
+    /// `lambda_extension_compute_stats`).
+    fn setup_with_config(config: Arc<config::Config>) -> Processor {
+        let aws_config = Arc::new(AwsConfig {
+            region: "us-east-1".into(),
+            aws_lwa_proxy_lambda_runtime_api: Some("***".into()),
+            function_name: "test-function".into(),
+            sandbox_init_time: Instant::now(),
+            runtime_api: "***".into(),
+            exec_wrapper: None,
+            initialization_type: "on-demand".into(),
+        });
+        let tags_provider = Arc::new(provider::Provider::new(
+            Arc::clone(&config),
+            LAMBDA_RUNTIME_SLUG.to_string(),
+            &HashMap::from([("function_arn".to_string(), "test-arn".to_string())]),
+        ));
+        let (service, handle) =
+            AggregatorService::new(EMPTY_TAGS, 1024).expect("failed to create aggregator service");
+        tokio::spawn(service.run());
+        let propagator = Arc::new(DatadogCompositePropagator::new(Arc::clone(&config)));
+        let (durable_context_tx, _) = tokio::sync::mpsc::channel(1);
+        Processor::new(
+            tags_provider,
+            config,
+            aws_config,
+            handle,
+            propagator,
+            durable_context_tx,
+        )
+    }
+
+    /// Like [`make_trace_sender`], but returns the receiver so the test can inspect the
+    /// processed payload that Path B sends downstream.
+    fn make_trace_sender_with_rx(
+        config: Arc<config::Config>,
+    ) -> (
+        Arc<SendingTraceProcessor>,
+        tokio::sync::mpsc::Receiver<crate::traces::trace_aggregator::SendDataBuilderInfo>,
+    ) {
+        use libdd_trace_obfuscation::obfuscation_config::ObfuscationConfig;
+        let (stats_concentrator_service, stats_concentrator_handle) =
+            StatsConcentratorService::new(Arc::clone(&config));
+        tokio::spawn(stats_concentrator_service.run());
+        let (trace_tx, trace_rx) = tokio::sync::mpsc::channel(8);
+        let sender = Arc::new(SendingTraceProcessor {
+            appsec: None,
+            processor: Arc::new(trace_processor::ServerlessTraceProcessor {
+                obfuscation_config: Arc::new(
+                    ObfuscationConfig::new().expect("Failed to create ObfuscationConfig"),
+                ),
+            }),
+            trace_tx,
+            stats_generator: Arc::new(StatsGenerator::new(stats_concentrator_handle)),
+        });
+        (sender, trace_rx)
+    }
+
+    /// APMSVLS-487 Tier 2: the extension-generated `aws.lambda` span (Path B) stamps
+    /// `_dd.compute_stats="1"` only when neither the extension nor the tracer computes stats;
+    /// otherwise the key is absent. `client_computed_stats` is propagated from the context.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn test_send_ctx_spans_stamps_compute_stats() {
+        use crate::tags::lambda::tags::COMPUTE_STATS_KEY;
+        use libdd_trace_utils::tracer_payload::TracerPayloadCollection;
+
+        #[cfg(feature = "fips")]
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        #[cfg(not(feature = "fips"))]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // (compute_on_extension, client_computed_stats) -> expected meta value on aws.lambda span
+        let cases = [
+            (false, false, Some("1")),
+            (false, true, None),
+            (true, false, None),
+            (true, true, None),
+        ];
+
+        for (compute_on_extension, client_computed_stats, expected) in cases {
+            let config = Arc::new(config::Config {
+                apm_dd_url: "https://trace.agent.datadoghq.com".to_string(),
+                service: Some("test-service".to_string()),
+                ext: config::LambdaConfig {
+                    lambda_extension_compute_stats: compute_on_extension,
+                    ..Default::default()
+                },
+                ..config::Config::default()
+            });
+            let mut processor = setup_with_config(Arc::clone(&config));
+            let (trace_sender, mut trace_rx) = make_trace_sender_with_rx(Arc::clone(&config));
+
+            let mut context = Context::from_request_id("req-1");
+            context.client_computed_stats = client_computed_stats;
+            context.invocation_span = Span {
+                name: "aws.lambda".to_string(),
+                resource: "test-resource".to_string(),
+                service: "test-service".to_string(),
+                span_id: 1,
+                trace_id: 100,
+                ..Default::default()
+            };
+
+            let tags_provider = Arc::new(provider::Provider::new(
+                Arc::clone(&config),
+                LAMBDA_RUNTIME_SLUG.to_string(),
+                &HashMap::from([("function_arn".to_string(), "test-arn".to_string())]),
+            ));
+            processor
+                .send_ctx_spans(&tags_provider, &trace_sender, context)
+                .await;
+
+            let info = trace_rx.recv().await.expect("expected a sent payload");
+            let send_data = info.builder.build();
+            let TracerPayloadCollection::V07(payloads) = send_data.get_payloads() else {
+                panic!("expected V07 payload");
+            };
+            let aws_lambda_span = payloads
+                .iter()
+                .flat_map(|p| &p.chunks)
+                .flat_map(|c| &c.spans)
+                .find(|s| s.name == "aws.lambda")
+                .expect("aws.lambda span should be present");
+
+            assert_eq!(
+                aws_lambda_span
+                    .meta
+                    .get(COMPUTE_STATS_KEY)
+                    .map(String::as_str),
+                expected,
+                "compute_on_extension={compute_on_extension}, client_computed_stats={client_computed_stats}"
+            );
+        }
     }
 }

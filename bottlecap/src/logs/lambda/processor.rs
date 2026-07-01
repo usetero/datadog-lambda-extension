@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use crate::logs::processor::{Processor, Rule};
 use crate::policy::PolicyEvaluator;
 use crate::tags::provider;
 
-use crate::logs::lambda::{IntakeLog, Message};
+use crate::logs::lambda::{DurableExecutionContext, IntakeLog, Message};
 
 #[allow(clippy::module_name_repetitions)]
 #[derive(Clone)]
@@ -40,7 +41,35 @@ pub struct LambdaProcessor {
     is_managed_instance_mode: bool,
     // Policy evaluator for filtering logs
     policy_evaluator: Option<Arc<PolicyEvaluator>>,
+    // Whether this is a Durable Function runtime.
+    // None = not yet determined (hold all logs until known). Happens during cold start.
+    // Some(true) = durable function. Hold logs for a request_id until
+    // the durable execution id and execution name for this invocation are known.
+    // These two fields are extracted from the aws.lambda span sent by the tracer.
+    // Some(false) = not a durable function; mark logs as ready to be aggregated as normal.
+    is_durable_function: Option<bool>,
+    // Logs held pending resolution, keyed by request_id.
+    // While is_durable_function is None, every incoming log (except durable execution SDK logs)
+    // is stashed here so we can decide whether to filter/tag it once the flag is known.
+    // While is_durable_function is Some(true), logs whose request_id has no
+    // durable execution context yet are also stashed here; they are drained
+    // the moment that context arrives.
+    // When held_logs reaches capacity, the oldest key is evicted to ready_logs (without durable
+    // context tags) to ensure logs are always sent even if the tracer is not installed.
+    held_logs: HashMap<String, Vec<IntakeLog>>,
+    // Insertion order for FIFO eviction when held_logs reaches capacity
+    held_logs_order: VecDeque<String>,
+    // Maps request_id -> (durable execution id, durable execution name)
+    durable_context_map: HashMap<String, DurableExecutionContext>,
+    // Insertion order for FIFO eviction when map reaches capacity
+    durable_context_order: VecDeque<String>,
+    // Max number of request ID keys in held_logs. 0 disables holding entirely.
+    lambda_durable_function_log_buffer_size: usize,
 }
+
+// Matches `lifecycle::invocation::ContextBuffer` default capacity: sized to absorb async
+// event backlog where invocation contexts may arrive out of order.
+const DURABLE_CONTEXT_MAP_CAPACITY: usize = 500;
 
 const OOM_ERRORS: [&str; 7] = [
     "fatal error: runtime: out of memory",       // Go
@@ -56,6 +85,27 @@ fn is_oom_error(error_msg: &str) -> bool {
     OOM_ERRORS
         .iter()
         .any(|&oom_str| error_msg.contains(oom_str))
+}
+
+/// Returns `true` for START, END, and REPORT platform logs.
+/// These are the only logs that carry the `first_invocation` attribute.
+fn is_platform_log(message: &str) -> bool {
+    message.starts_with("START RequestId:")
+        || message.starts_with("END RequestId:")
+        || message.starts_with("REPORT RequestId:")
+}
+
+/// Parses a Lambda durable execution ARN and returns `(execution_id, execution_name)`.
+///
+/// Expected format:
+/// `arn:aws:lambda:{region}:{account}:function:{name}:{version}/durable-execution/{exec_name}/{exec_id}`
+fn parse_durable_execution_arn(arn: &str) -> Option<(String, String)> {
+    const SEPARATOR: &str = "/durable-execution/";
+    let durable_part = arn.split(SEPARATOR).nth(1)?;
+    let mut parts = durable_part.splitn(2, '/');
+    let exec_name = parts.next().filter(|s| !s.is_empty())?.to_string();
+    let exec_id = parts.next().filter(|s| !s.is_empty())?.to_string();
+    Some((exec_id, exec_name))
 }
 
 /// Maps AWS/common log level strings to Datadog log status values.
@@ -94,7 +144,9 @@ impl LambdaProcessor {
         let function_arn = tags_provider.get_canonical_id().unwrap_or_default();
 
         let processing_rules = &datadog_config.logs_config_processing_rules;
-        let logs_enabled = datadog_config.serverless_logs_enabled;
+        let logs_enabled = datadog_config.ext.serverless_logs_enabled;
+        let lambda_durable_function_log_buffer_size =
+            datadog_config.ext.lambda_durable_function_log_buffer_size;
         let rules = LambdaProcessor::compile_rules(processing_rules);
         LambdaProcessor {
             function_arn,
@@ -108,6 +160,31 @@ impl LambdaProcessor {
             event_bus,
             is_managed_instance_mode,
             policy_evaluator,
+            is_durable_function: None,
+            held_logs: HashMap::new(),
+            held_logs_order: VecDeque::new(),
+            durable_context_map: HashMap::with_capacity(DURABLE_CONTEXT_MAP_CAPACITY),
+            durable_context_order: VecDeque::with_capacity(DURABLE_CONTEXT_MAP_CAPACITY),
+            lambda_durable_function_log_buffer_size,
+        }
+    }
+
+    /// Returns the `request_id` of the currently-active invocation, if known.
+    /// Used by the OOM log-line detector as a fallback when the matched log
+    /// payload doesn't carry a `requestId` field (text payloads — Node V8
+    /// fatal output, Go fatal, Java stderr, etc.). The payload field is
+    /// preferred when available because it matches the log line exactly and
+    /// doesn't race with `PlatformStart`.
+    ///
+    /// `invocation_context.request_id` is set when this processor handles
+    /// `PlatformStart` and cleared on `PlatformRuntimeDone` / `PlatformReport`,
+    /// so this returns `None` when an OOM log line is processed outside that
+    /// window.
+    fn current_request_id(&self) -> Option<String> {
+        if self.invocation_context.request_id.is_empty() {
+            None
+        } else {
+            Some(self.invocation_context.request_id.clone())
         }
     }
 
@@ -116,38 +193,55 @@ impl LambdaProcessor {
         let copy = event.clone();
         match event.record {
             TelemetryRecord::Function(v) => {
-                let (request_id, message) = match v {
+                let (request_id, message, durable_ctx) = match v {
                     serde_json::Value::Object(obj) => {
-                        let request_id = if self.is_managed_instance_mode {
-                            obj.get("requestId")
-                                .or_else(|| obj.get("AWSRequestId"))
-                                .and_then(|v| v.as_str())
-                                .map(ToString::to_string)
-                        } else {
-                            None
-                        };
+                        let request_id = obj.get("requestId")
+                            .or_else(|| obj.get("AWSRequestId"))
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
+                        // When a message is logged from the durable execution SDK, it contains an `executionArn` field.
+                        // In this case, extract the durable execution context from the `executionArn` field, and later
+                        // set durable execution id and name as log attributes.
+                        let durable_ctx = obj.get("executionArn")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_durable_execution_arn);
                         let msg = Some(serde_json::to_string(&obj).unwrap_or_default());
-                        (request_id, msg)
+                        (request_id, msg, durable_ctx)
                     },
-                    serde_json::Value::String(s) => (None, Some(s)),
-                    _ => (None, None),
+                    serde_json::Value::String(s) => (None, Some(s), None),
+                    _ => (None, None, None),
                 };
 
                 if let Some(message) = message {
                     if is_oom_error(&message) {
                         debug!("LOGS | Got a runtime-specific OOM error. Incrementing OOM metric.");
-                        if let Err(e) = self.event_bus.send(Event::OutOfMemory(event.time.timestamp())).await {
+                        // Prefer the `requestId` from the log payload (most accurate for this exact log line).
+                        // Fall back to `current_request_id()` only when the payload doesn't carry it —
+                        // i.e., for text payloads, or JSON without a `requestId` field.
+
+                        let oom_request_id = request_id.clone().or_else(|| self.current_request_id());
+                        if let Err(e) = self.event_bus.send(Event::OutOfMemory {
+                            request_id: oom_request_id,
+                            timestamp: event.time.timestamp(),
+                        }).await {
                             error!("LOGS | Failed to send OOM event to the main event bus: {e}");
                         }
                     }
 
-                    return Ok(Message::new(
+                    let mut msg = Message::new(
                         message,
                         request_id,
                         self.function_arn.clone(),
                         event.time.timestamp_millis(),
                         None,
-                    ));
+                    );
+                    // If the message is logged from the durable execution SDK,
+                    // set durable execution id and name as log attributes.
+                    if let Some((exec_id, exec_name)) = durable_ctx {
+                        msg.lambda.durable_execution_id = Some(exec_id);
+                        msg.lambda.durable_execution_name = Some(exec_name);
+                    }
+                    return Ok(msg);
                 }
 
                 Err("Unable to parse log".into())
@@ -162,7 +256,10 @@ impl LambdaProcessor {
                 if let Some(message) = message {
                     if is_oom_error(&message) {
                         debug!("LOGS | Got a runtime-specific OOM error. Incrementing OOM metric.");
-                        if let Err(e) = self.event_bus.send(Event::OutOfMemory(event.time.timestamp())).await {
+                        if let Err(e) = self.event_bus.send(Event::OutOfMemory {
+                            request_id: self.current_request_id(),
+                            timestamp: event.time.timestamp(),
+                        }).await {
                             error!("LOGS | Failed to send OOM event to the main event bus: {e}");
                         }
                     }
@@ -189,6 +286,10 @@ impl LambdaProcessor {
 
                 let rv = runtime_version.unwrap_or("?".to_string()); // TODO: check what does containers display
                 let rv_arn = runtime_version_arn.unwrap_or("?".to_string()); // TODO: check what do containers display
+
+                let is_durable = rv.contains("DurableFunction");
+                self.is_durable_function = Some(is_durable);
+                self.resolve_held_logs_on_durable_function_set(is_durable);
 
                 Ok(Message::new(
                     format!("INIT_START Runtime Version: {rv} Runtime Version ARN: {rv_arn}"),
@@ -472,6 +573,106 @@ impl LambdaProcessor {
         }
     }
 
+    /// Inserts the durable execution context for a `request_id`, received from the `aws.lambda`
+    /// span. Evicts the oldest entry when the map is at capacity. Drains any held logs for that
+    /// `request_id`.
+    pub fn insert_to_durable_context_map(
+        &mut self,
+        request_id: &str,                 // key
+        execution_id: &str,               // value
+        execution_name: &str,             // value
+        first_invocation: Option<bool>,   // value
+        execution_status: Option<String>, // value
+    ) {
+        if self.durable_context_map.contains_key(request_id) {
+            error!("LOGS | insert_to_durable_context_map: request_id={request_id} already in map");
+            return;
+        }
+        if self.durable_context_order.len() >= DURABLE_CONTEXT_MAP_CAPACITY
+            && let Some(oldest) = self.durable_context_order.pop_front()
+        {
+            self.durable_context_map.remove(&oldest);
+        }
+        self.durable_context_order.push_back(request_id.to_string());
+        self.durable_context_map.insert(
+            request_id.to_string(),
+            DurableExecutionContext {
+                execution_id: execution_id.to_string(),
+                execution_name: execution_name.to_string(),
+                first_invocation,
+                execution_status,
+            },
+        );
+        self.drain_held_logs_for_request_id(request_id);
+    }
+
+    pub fn take_ready_logs(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.ready_logs)
+    }
+
+    /// Drains all remaining `held_logs` to `ready_logs` without durable context tags.
+    /// Called at shutdown to ensure no logs are lost even if durable context never arrived.
+    pub fn drain_held_logs(&mut self) {
+        let held = std::mem::take(&mut self.held_logs);
+        self.held_logs_order.clear();
+        for (_, logs) in held {
+            for log in logs {
+                if let Ok(s) = serde_json::to_string(&log) {
+                    self.ready_logs.push(s);
+                }
+            }
+        }
+    }
+
+    /// Moves all logs held for `request_id` into `ready_logs`, tagging each with the
+    /// durable execution context that is now known for that `request_id`.
+    fn drain_held_logs_for_request_id(&mut self, request_id: &str) {
+        let Some(held) = self.held_logs.remove(request_id) else {
+            return;
+        };
+        self.held_logs_order.retain(|r| r != request_id);
+        let durable_ctx = self.durable_context_map.get(request_id).cloned();
+        if let Some(ctx) = durable_ctx {
+            for log in held {
+                self.set_durable_context_and_mark_ready(log, &ctx);
+            }
+        }
+    }
+
+    /// Called once when `is_durable_function` is set, draining every entry in `held_logs`:
+    /// - `false` → drain all held logs.
+    /// - `true`  → drain logs whose `request_id` is already in `durable_context_map`,
+    ///   the rest stay in `held_logs` until their context arrives via an `aws.lambda` span.
+    fn resolve_held_logs_on_durable_function_set(&mut self, is_durable: bool) {
+        let held = std::mem::take(&mut self.held_logs);
+        self.held_logs_order.clear();
+        if is_durable {
+            // Drain logs whose request_id is already in the map.
+            for (request_id, logs) in held {
+                let durable_ctx = self.durable_context_map.get(&request_id).cloned();
+                if let Some(ctx) = durable_ctx {
+                    // If the request_id is in the durable context map, set durable execution id
+                    // and execution name, and add logs to ready_logs.
+                    for log in logs {
+                        self.set_durable_context_and_mark_ready(log, &ctx);
+                    }
+                } else {
+                    // No context yet — keep logs in held_logs until the aws.lambda span arrives.
+                    self.held_logs.insert(request_id, logs);
+                }
+            }
+        } else {
+            // Drain all held logs.
+            for (_, logs) in held {
+                for log in logs {
+                    if let Ok(s) = serde_json::to_string(&log) {
+                        self.ready_logs.push(s);
+                    }
+                }
+            }
+        }
+    }
+
     /// Processes a log, applies filtering rules, serializes it, and queues it for aggregation
     fn process_and_queue_log(&mut self, mut log: IntakeLog) {
         let should_send_log = self.logs_enabled
@@ -489,11 +690,149 @@ impl LambdaProcessor {
             return;
         }
 
-        if let Ok(serialized_log) = serde_json::to_string(&log) {
+        self.queue_log_after_rules(log);
+    }
+
+    /// Applies durable execution context to a log and pushes it to `ready_logs`.
+    /// `first_invocation` is set only for platform logs (START/END/REPORT).
+    fn set_durable_context_and_mark_ready(
+        &mut self,
+        mut log: IntakeLog,
+        ctx: &DurableExecutionContext,
+    ) {
+        log.message.lambda.durable_execution_id = Some(ctx.execution_id.clone());
+        log.message.lambda.durable_execution_name = Some(ctx.execution_name.clone());
+        if is_platform_log(&log.message.message) {
+            log.message.lambda.first_invocation = ctx.first_invocation;
+        }
+        if log.message.message.starts_with("END RequestId:") {
+            log.message
+                .lambda
+                .durable_execution_status
+                .clone_from(&ctx.execution_status);
+        }
+        if let Ok(s) = serde_json::to_string(&log) {
             // explicitly drop log so we don't accidentally re-use it and push
             // duplicate logs to the aggregator
             drop(log);
-            self.ready_logs.push(serialized_log);
+            self.ready_logs.push(s);
+        }
+    }
+
+    /// Stashes a log in `held_logs` under `request_id`, waiting for durable context.
+    ///
+    /// If `held_logs` is at capacity and `request_id` is a new key, the oldest key is evicted:
+    /// its logs are drained to `ready_logs` without durable context tags. This ensures logs are
+    /// always eventually sent to Datadog even if the tracer is not installed and context never
+    /// arrives.
+    ///
+    /// Callers must ensure `self.lambda_durable_function_log_buffer_size > 0` before invoking
+    /// this function. A safety net at the top returns early if the invariant is violated.
+    fn hold_log(&mut self, request_id: String, log: IntakeLog) {
+        if self.lambda_durable_function_log_buffer_size == 0 {
+            return;
+        }
+        if !self.held_logs.contains_key(&request_id) {
+            while self.held_logs.len() >= self.lambda_durable_function_log_buffer_size {
+                // Evict the oldest key to ready_logs (without durable context tags).
+                if let Some(oldest) = self.held_logs_order.pop_front()
+                    && let Some(evicted) = self.held_logs.remove(&oldest)
+                {
+                    for evicted_log in evicted {
+                        if let Ok(s) = serde_json::to_string(&evicted_log) {
+                            self.ready_logs.push(s);
+                        }
+                    }
+                }
+            }
+            self.held_logs_order.push_back(request_id.clone());
+        }
+        self.held_logs.entry(request_id).or_default().push(log);
+    }
+
+    /// Queues a log that has already had processing rules applied.
+    ///
+    /// Logs from the durable execution SDK include an `executionArn` field from which
+    /// `durable_execution_id` and `durable_execution_name` are extracted in `get_message()`.
+    /// Such logs are pushed directly to `ready_logs` without holding.
+    ///
+    /// For all other logs, routing depends on `is_durable_function`:
+    /// - `None`        → stash in `held_logs[request_id]`; logs without a `request_id` are
+    ///   marked as ready to be aggregated since they cannot carry durable context.
+    /// - `Some(false)` → serialize and push straight to `ready_logs`.
+    /// - `Some(true)`  → mark this log as ready to be aggregated if its `request_id` is already in `durable_context_map`
+    ///   (context was populated by an `aws.lambda` span); otherwise stash in `held_logs`.
+    fn queue_log_after_rules(&mut self, log: IntakeLog) {
+        // Durable execution SDK logs already carry execution context extracted from executionArn.
+        if log.message.lambda.durable_execution_id.is_some() {
+            if let Ok(serialized_log) = serde_json::to_string(&log) {
+                drop(log);
+                self.ready_logs.push(serialized_log);
+            }
+            return;
+        }
+
+        // When the buffer is disabled, skip holding and send logs immediately without
+        // durable execution context enrichment.
+        if self.lambda_durable_function_log_buffer_size == 0 {
+            if let Ok(serialized_log) = serde_json::to_string(&log) {
+                drop(log);
+                self.ready_logs.push(serialized_log);
+            }
+            return;
+        }
+
+        match self.is_durable_function {
+            // We don't yet know if this is a durable function. Hold the log until we know.
+            None => {
+                if let Some(rid) = log.message.lambda.request_id.clone() {
+                    self.hold_log(rid, log);
+                } else {
+                    // Some logs may not have a request_id. Mark these logs as ready
+                    // to be aggregated since they cannot carry durable context.
+                    if let Ok(serialized_log) = serde_json::to_string(&log) {
+                        drop(log);
+                        self.ready_logs.push(serialized_log);
+                    }
+                }
+            }
+            // Not a durable function. Serialize and push the log.
+            Some(false) => {
+                if let Ok(serialized_log) = serde_json::to_string(&log) {
+                    // explicitly drop log so we don't accidentally re-use it and push
+                    // duplicate logs to the aggregator
+                    drop(log);
+                    self.ready_logs.push(serialized_log);
+                }
+            }
+            // Durable function. Mark this log as ready to be aggregated if its request_id already has context; otherwise hold.
+            Some(true) => {
+                let durable_ctx = log
+                    .message
+                    .lambda
+                    .request_id
+                    .as_ref()
+                    .and_then(|rid| self.durable_context_map.get(rid))
+                    .cloned();
+
+                match durable_ctx {
+                    Some(ctx) => {
+                        self.set_durable_context_and_mark_ready(log, &ctx);
+                    }
+                    None => {
+                        if let Some(rid) = log.message.lambda.request_id.clone() {
+                            self.hold_log(rid, log);
+                        } else {
+                            // Some logs may not have a request_id. Mark these logs as ready
+                            // to be aggregated since they cannot carry durable context.
+                            if let Ok(serialized_log) = serde_json::to_string(&log) {
+                                drop(log);
+                                self.ready_logs.push(serialized_log);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -588,6 +927,7 @@ mod tests {
                     lambda: Lambda {
                         arn: "test-arn".to_string(),
                         request_id: None,
+                    ..Lambda::default()
                     },
                     timestamp: 1_673_061_827_000,
                     status: "info".to_string(),
@@ -605,6 +945,7 @@ mod tests {
                     lambda: Lambda {
                         arn: "test-arn".to_string(),
                         request_id: None,
+                    ..Lambda::default()
                     },
                     timestamp: 1_673_061_827_000,
                     status: "info".to_string(),
@@ -627,6 +968,7 @@ mod tests {
                     lambda: Lambda {
                         arn: "test-arn".to_string(),
                         request_id: None,
+                    ..Lambda::default()
                     },
                     timestamp: 1_673_061_827_000,
                     status: "info".to_string(),
@@ -647,6 +989,7 @@ mod tests {
                     lambda: Lambda {
                         arn: "test-arn".to_string(),
                         request_id: Some("test-request-id".to_string()),
+                    ..Lambda::default()
                     },
                     timestamp: 1_673_061_827_000,
                     status: "info".to_string(),
@@ -672,6 +1015,7 @@ mod tests {
                     lambda: Lambda {
                         arn: "test-arn".to_string(),
                         request_id: Some("test-request-id".to_string()),
+                    ..Lambda::default()
                     },
                     timestamp: 1_673_061_827_000,
                     status: "info".to_string(),
@@ -697,6 +1041,7 @@ mod tests {
                     lambda: Lambda {
                         arn: "test-arn".to_string(),
                         request_id: Some("test-request-id".to_string()),
+                    ..Lambda::default()
                     },
                     timestamp: 1_673_061_827_000,
                     status: "error".to_string(),
@@ -727,6 +1072,7 @@ mod tests {
                     lambda: Lambda {
                         arn: "test-arn".to_string(),
                         request_id: Some("test-request-id".to_string()),
+                    ..Lambda::default()
                     },
                     timestamp: 1_673_061_827_000,
                     status: "info".to_string(),
@@ -752,6 +1098,7 @@ mod tests {
                 lambda: Lambda {
                     arn: "test-arn".to_string(),
                     request_id: Some("test-request-id".to_string()),
+                ..Lambda::default()
                 },
                 timestamp: 1_673_058_627_000,
                 status: "info".to_string(),
@@ -777,6 +1124,7 @@ mod tests {
                 lambda: Lambda {
                     arn: "test-arn".to_string(),
                     request_id: Some("test-request-id".to_string()),
+                ..Lambda::default()
                 },
                 timestamp: 1_673_058_627_000,
                 status: "error".to_string(),
@@ -802,6 +1150,7 @@ mod tests {
                 lambda: Lambda {
                     arn: "test-arn".to_string(),
                     request_id: Some("test-request-id".to_string()),
+                ..Lambda::default()
                 },
                 timestamp: 1_673_058_627_000,
                 status: "error".to_string(),
@@ -827,6 +1176,7 @@ mod tests {
                 lambda: Lambda {
                     arn: "test-arn".to_string(),
                     request_id: Some("test-request-id".to_string()),
+                ..Lambda::default()
                 },
                 timestamp: 1_673_058_627_000,
                 status: "error".to_string(),
@@ -907,6 +1257,7 @@ mod tests {
                 lambda: Lambda {
                     arn: "test-arn".to_string(),
                     request_id: Some("test-request-id".to_string()),
+                    ..Lambda::default()
                 },
                 timestamp: 1_673_061_827_000,
                 status: "info".to_string(),
@@ -1064,6 +1415,7 @@ mod tests {
             false,
             None,
         );
+        processor.is_durable_function = Some(false);
 
         let event = TelemetryEvent {
             time: Utc.with_ymd_and_hms(2023, 1, 7, 3, 23, 47).unwrap(),
@@ -1084,6 +1436,7 @@ mod tests {
                 lambda: Lambda {
                     arn: "test-arn".to_string(),
                     request_id: Some("test-request-id".to_string()),
+                    ..Lambda::default()
                 },
                 timestamp: 1_673_061_827_000,
                 status: "info".to_string(),
@@ -1109,7 +1462,10 @@ mod tests {
         let config = Arc::new(config::Config {
             service: Some("test-service".to_string()),
             tags: HashMap::from([("test".to_string(), "tags".to_string())]),
-            serverless_logs_enabled: false,
+            ext: config::LambdaConfig {
+                serverless_logs_enabled: false,
+                ..Default::default()
+            },
             ..config::Config::default()
         });
 
@@ -1226,6 +1582,7 @@ mod tests {
             false,
             None,
         );
+        processor.is_durable_function = Some(false);
 
         let start_event = TelemetryEvent {
             time: Utc.with_ymd_and_hms(2023, 1, 7, 3, 23, 47).unwrap(),
@@ -1260,6 +1617,7 @@ mod tests {
                 lambda: Lambda {
                     arn: "test-arn".to_string(),
                     request_id: Some("test-request-id".to_string()),
+                    ..Lambda::default()
                 },
                 timestamp: 1_673_061_827_000,
                 status: "info".to_string(),
@@ -1275,6 +1633,7 @@ mod tests {
                 lambda: Lambda {
                     arn: "test-arn".to_string(),
                     request_id: Some("test-request-id".to_string()),
+                    ..Lambda::default()
                 },
                 timestamp: 1_673_061_827_000,
                 status: "info".to_string(),
@@ -1350,6 +1709,7 @@ mod tests {
                 lambda: Lambda {
                     arn: "test-arn".to_string(),
                     request_id: Some("test-request-id".to_string()),
+                    ..Lambda::default()
                 },
                 timestamp: 1_673_061_827_000,
                 status: "info".to_string(),
@@ -1412,6 +1772,7 @@ mod tests {
                 lambda: Lambda {
                     arn: "test-arn".to_string(),
                     request_id: Some("test-request-id".to_string()),
+                ..Lambda::default()
                 },
                 timestamp: 1_673_061_827_000,
                 status: "info".to_string(),
@@ -1463,6 +1824,7 @@ mod tests {
             false,
             None,
         );
+        processor.is_durable_function = Some(false);
 
         // First, send an extension log (orphan) that doesn't have a request_id
         let extension_event = TelemetryEvent {
@@ -1648,7 +2010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_regular_lambda_does_not_extract_request_id() {
+    async fn test_regular_lambda_extracts_request_id_from_payload() {
         let tags = HashMap::from([("test".to_string(), "tags".to_string())]);
         let config = Arc::new(config::Config {
             service: Some("test-service".to_string()),
@@ -1676,7 +2038,10 @@ mod tests {
             None,
         );
 
-        // Test that requestId is NOT extracted in regular Lambda mode
+        // The payload `requestId` is extracted in both regular and LMI mode
+        // so that the OOM detector can dedup against the other detection paths
+        // by tagging `Event::OutOfMemory` with the request id of the exact log
+        // line that matched.
         let mut obj = serde_json::Map::new();
         obj.insert(
             "requestId".to_string(),
@@ -1693,8 +2058,10 @@ mod tests {
         };
 
         let result = processor.get_message(event).await.unwrap();
-        // Should be None because we're not in LMI mode
-        assert_eq!(result.lambda.request_id, None);
+        assert_eq!(
+            result.lambda.request_id,
+            Some("test-request-789".to_string())
+        );
     }
 
     #[test]
@@ -2317,5 +2684,192 @@ mod tests {
         service_handle
             .await
             .expect("Aggregator service task failed");
+    }
+
+    // --- parse_durable_execution_arn ---
+
+    #[test]
+    fn test_parse_durable_execution_arn_valid() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:function:my-function:1/durable-execution/my-exec-name/exec-id-abc";
+        let result = parse_durable_execution_arn(arn);
+        assert_eq!(
+            result,
+            Some(("exec-id-abc".to_string(), "my-exec-name".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_durable_execution_arn_latest() {
+        let arn = "arn:aws:lambda:us-west-2:999999999999:function:fn:$LATEST/durable-execution/exec-name/exec-uuid-123";
+        let result = parse_durable_execution_arn(arn);
+        assert_eq!(
+            result,
+            Some(("exec-uuid-123".to_string(), "exec-name".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_durable_execution_arn_missing_separator() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:function:my-function:1";
+        assert!(parse_durable_execution_arn(arn).is_none());
+    }
+
+    #[test]
+    fn test_parse_durable_execution_arn_missing_exec_id() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:function:my-function:1/durable-execution/only-name";
+        assert!(parse_durable_execution_arn(arn).is_none());
+    }
+
+    // --- executionArn extraction in get_message / queue_log_after_rules ---
+
+    fn make_processor_for_durable_arn_tests() -> LambdaProcessor {
+        let tags = HashMap::new();
+        let config = Arc::new(config::Config {
+            service: Some("test-service".to_string()),
+            tags: tags.clone(),
+            ext: config::LambdaConfig {
+                serverless_logs_enabled: true,
+                ..Default::default()
+            },
+            ..config::Config::default()
+        });
+        let tags_provider = Arc::new(provider::Provider::new(
+            Arc::clone(&config),
+            LAMBDA_RUNTIME_SLUG.to_string(),
+            &HashMap::from([("function_arn".to_string(), "test-arn".to_string())]),
+        ));
+        let (tx, _) = tokio::sync::mpsc::channel(2);
+        LambdaProcessor::new(tags_provider, config, tx, false, None)
+    }
+
+    #[tokio::test]
+    async fn test_durable_sdk_log_sets_execution_context_from_execution_arn() {
+        let mut processor = make_processor_for_durable_arn_tests();
+        let event = TelemetryEvent {
+            time: Utc.with_ymd_and_hms(2023, 1, 7, 3, 23, 47).unwrap(),
+            record: TelemetryRecord::Function(Value::Object(serde_json::from_str(
+                r#"{"message":"hello","executionArn":"arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/my-name/my-id"}"#
+            ).unwrap())),
+        };
+        let msg = processor.get_message(event).await.unwrap();
+        assert_eq!(msg.lambda.durable_execution_id, Some("my-id".to_string()));
+        assert_eq!(
+            msg.lambda.durable_execution_name,
+            Some("my-name".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_durable_sdk_log_pushed_to_ready_logs_without_holding() {
+        let mut processor = make_processor_for_durable_arn_tests();
+        // is_durable_function is still None (PlatformInitStart not yet received)
+        assert!(processor.is_durable_function.is_none());
+        // Durable SDK logs arrive during an invocation, so request_id is set
+        processor.invocation_context.request_id = "req-abc".to_string();
+
+        let event = TelemetryEvent {
+            time: Utc.with_ymd_and_hms(2023, 1, 7, 3, 23, 47).unwrap(),
+            record: TelemetryRecord::Function(Value::Object(serde_json::from_str(
+                r#"{"message":"hello","executionArn":"arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/my-name/my-id"}"#
+            ).unwrap())),
+        };
+        let (aggregator_service, aggregator_handle) = AggregatorService::default();
+        tokio::spawn(async move { aggregator_service.run().await });
+        processor.process(event, &aggregator_handle).await;
+
+        // Log should have been sent to aggregator (not held)
+        assert!(processor.held_logs.is_empty());
+        let batches = aggregator_handle.get_batches().await.unwrap();
+        assert_eq!(batches.len(), 1);
+        let logs: Vec<serde_json::Value> = serde_json::from_slice(&batches[0]).unwrap();
+        assert_eq!(
+            logs[0]["message"]["lambda"]["durable_function.execution_id"],
+            "my-id"
+        );
+        assert_eq!(
+            logs[0]["message"]["lambda"]["durable_function.execution_name"],
+            "my-name"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_durable_sdk_log_pushed_to_ready_logs_even_in_durable_function_mode() {
+        let mut processor = make_processor_for_durable_arn_tests();
+        processor.is_durable_function = Some(true);
+        processor.invocation_context.request_id = "req-abc".to_string();
+
+        let event = TelemetryEvent {
+            time: Utc.with_ymd_and_hms(2023, 1, 7, 3, 23, 47).unwrap(),
+            record: TelemetryRecord::Function(Value::Object(serde_json::from_str(
+                r#"{"message":"hello","executionArn":"arn:aws:lambda:us-east-1:123:function:fn:1/durable-execution/my-name/my-id"}"#
+            ).unwrap())),
+        };
+        let (aggregator_service, aggregator_handle) = AggregatorService::default();
+        tokio::spawn(async move { aggregator_service.run().await });
+        processor.process(event, &aggregator_handle).await;
+
+        assert!(processor.held_logs.is_empty());
+        let batches = aggregator_handle.get_batches().await.unwrap();
+        assert_eq!(batches.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_function_log_without_execution_arn_is_held_in_durable_mode() {
+        let mut processor = make_processor_for_durable_arn_tests();
+        processor.lambda_durable_function_log_buffer_size = 50;
+        processor.is_durable_function = Some(true);
+        // Simulate a known request_id with no durable context yet
+        processor.invocation_context.request_id = "req-123".to_string();
+
+        let event = TelemetryEvent {
+            time: Utc.with_ymd_and_hms(2023, 1, 7, 3, 23, 47).unwrap(),
+            record: TelemetryRecord::Function(Value::String("plain log without ARN".to_string())),
+        };
+        let (aggregator_service, aggregator_handle) = AggregatorService::default();
+        tokio::spawn(async move { aggregator_service.run().await });
+        processor.process(event, &aggregator_handle).await;
+
+        // Should be held, not sent to aggregator
+        assert!(processor.held_logs.contains_key("req-123"));
+        let batches = aggregator_handle.get_batches().await.unwrap();
+        assert!(batches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execution_status_on_end_log() {
+        for (execution_status, expected) in [
+            (Some("SUCCEEDED"), serde_json::json!("SUCCEEDED")),
+            (None, serde_json::Value::Null),
+        ] {
+            let mut processor = make_processor_for_durable_arn_tests();
+            processor.lambda_durable_function_log_buffer_size = 50;
+            processor.is_durable_function = Some(true);
+            processor.invocation_context.request_id = "req-end".to_string();
+            processor.insert_to_durable_context_map(
+                "req-end",
+                "exec-id-123",
+                "exec-name-abc",
+                Some(false),
+                execution_status.map(str::to_string),
+            );
+            let event = TelemetryEvent {
+                time: Utc.with_ymd_and_hms(2023, 1, 7, 3, 23, 47).unwrap(),
+                record: TelemetryRecord::PlatformRuntimeDone {
+                    request_id: "req-end".to_string(),
+                    status: Status::Success,
+                    error_type: None,
+                    metrics: None,
+                },
+            };
+            let (aggregator_service, aggregator_handle) = AggregatorService::default();
+            tokio::spawn(async move { aggregator_service.run().await });
+            processor.process(event, &aggregator_handle).await;
+            let batches = aggregator_handle.get_batches().await.unwrap();
+            let logs: Vec<serde_json::Value> = serde_json::from_slice(&batches[0]).unwrap();
+            assert_eq!(
+                logs[0]["message"]["lambda"]["durable_function.execution_status"],
+                expected
+            );
+        }
     }
 }

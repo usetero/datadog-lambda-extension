@@ -5,7 +5,7 @@ use crate::metrics::enhanced::usage_metrics::{EnhancedMetricsHandle, EnhancedMet
 use crate::proc::{self, CPUData, NetworkData};
 use dogstatsd::metric::SortedTags;
 use dogstatsd::metric::{Metric, MetricValue};
-use dogstatsd::{aggregator_service::AggregatorHandle, metric};
+use dogstatsd::{aggregator::AggregatorHandle, metric};
 use std::collections::HashMap;
 use std::env::consts::ARCH;
 use std::sync::Arc;
@@ -61,6 +61,12 @@ impl Lambda {
             .insert(String::from("runtime"), runtime.to_string());
     }
 
+    /// Sets the `durable_function:true` tag in `dynamic_value_tags`
+    pub fn set_durable_function_tag(&mut self) {
+        self.dynamic_value_tags
+            .insert(String::from("durable_function"), String::from("true"));
+    }
+
     fn get_dynamic_value_tags(&self) -> Option<SortedTags> {
         let vec_tags: Vec<String> = self
             .dynamic_value_tags
@@ -85,12 +91,12 @@ impl Lambda {
         self.increment_metric(constants::TIMEOUTS_METRIC, timestamp);
     }
 
-    // This function is called in three cases:
-    // 1. Runtime-specific OOM error (can happen in .NET, Node.js and Java as far as we know)
-    // 2. PlatformRuntimeDone event reports "error_type: Runtime.OutOfMemory" (can happen in Ruby and Python as far as we know)
-    // 3. PlatformReport event reports "max_memory_used_mb == memory_size_mb" (can happen in many runtimes, but
-    //    we only call increment_oom_metric() for provided.al runtimes)
-    // This is our best effort to cover different cases without double counting. We can adjust this if we find more cases.
+    // Callers should generally go through `Processor::try_increment_oom_metric`,
+    // which provides best-effort dedup by `request_id` (see its doc for the
+    // edge cases that can still double-count). The three detection paths are:
+    // 1. Runtime-specific OOM log line (.NET, Node, Java, Go, Ruby, Python)
+    // 2. PlatformRuntimeDone with error_type == "Runtime.OutOfMemory" (Node, Ruby, Python)
+    // 3. PlatformReport with max_memory_used_mb == memory_size_mb (all runtimes)
     pub fn increment_oom_metric(&self, timestamp: i64) {
         self.increment_metric(constants::OUT_OF_MEMORY_METRIC, timestamp);
     }
@@ -101,7 +107,7 @@ impl Lambda {
         init_duration_ms: f64,
         timestamp: i64,
     ) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
         self.dynamic_value_tags
@@ -123,7 +129,7 @@ impl Lambda {
         restore_duration_ms: f64,
         timestamp: i64,
     ) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
         let metric = Metric::new(
@@ -143,13 +149,14 @@ impl Lambda {
     }
 
     fn increment_metric(&self, metric_name: &str, timestamp: i64) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
+        let tags = self.get_dynamic_value_tags();
         let metric = Metric::new(
             metric_name.into(),
             MetricValue::distribution(1f64),
-            self.get_dynamic_value_tags(),
+            tags,
             Some(timestamp),
         );
         if let Err(e) = self.aggr_handle.insert_batch(vec![metric]) {
@@ -158,7 +165,7 @@ impl Lambda {
     }
 
     pub fn set_runtime_done_metrics(&self, metrics: &RuntimeDoneMetrics, timestamp: i64) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
         let metric = Metric::new(
@@ -187,7 +194,7 @@ impl Lambda {
     }
 
     pub fn set_shutdown_metric(&self, timestamp: i64) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
         self.increment_metric(constants::SHUTDOWNS_METRIC, timestamp);
@@ -200,7 +207,7 @@ impl Lambda {
     }
 
     pub fn set_post_runtime_duration_metric(&self, duration_ms: f64, timestamp: i64) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
         let metric = metric::Metric::new(
@@ -263,7 +270,7 @@ impl Lambda {
     }
 
     pub fn set_network_enhanced_metrics(&self, network_offset: Option<NetworkData>) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
 
@@ -336,7 +343,7 @@ impl Lambda {
     }
 
     pub fn set_cpu_time_enhanced_metrics(&self, cpu_offset: Option<CPUData>) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
 
@@ -466,7 +473,7 @@ impl Lambda {
         cpu_offset: Option<CPUData>,
         uptime_offset: Option<f64>,
     ) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
 
@@ -508,7 +515,7 @@ impl Lambda {
     }
 
     pub fn set_report_log_metrics(&self, metrics: &ReportMetrics, timestamp: i64) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
         let metric = metric::Metric::new(
@@ -578,7 +585,7 @@ impl Lambda {
     }
 
     pub fn start_usage_metrics_task(&self) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
 
@@ -618,7 +625,7 @@ impl Lambda {
 
     // Reset metrics and resume monitoring for the next invocation
     pub fn restart_usage_metrics_monitoring(&self) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
 
@@ -632,7 +639,7 @@ impl Lambda {
 
     /// Resume monitoring without resetting metrics. Used in managed instance mode to resume monitoring between invocations.
     pub fn resume_usage_metrics_monitoring(&self) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
 
@@ -642,7 +649,7 @@ impl Lambda {
 
     /// Pause monitoring without emitting metrics. Used in managed instance mode to pause between invocations.
     pub fn pause_usage_metrics_monitoring(&self) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
 
@@ -650,7 +657,7 @@ impl Lambda {
     }
 
     pub fn set_usage_enhanced_metrics(&self) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
 
@@ -740,7 +747,7 @@ impl Lambda {
     }
 
     pub fn set_max_enhanced_metrics(&self) {
-        if !self.config.enhanced_metrics {
+        if !self.config.ext.enhanced_metrics {
             return;
         }
 
@@ -802,7 +809,7 @@ mod tests {
     use super::*;
     use crate::config;
     use crate::extension::telemetry::events::{OnDemandReportMetrics, ReportMetrics};
-    use dogstatsd::aggregator_service::AggregatorService;
+    use dogstatsd::aggregator::AggregatorService;
     use dogstatsd::metric::EMPTY_TAGS;
     const PRECISION: f64 = 0.000_000_01;
 
@@ -836,6 +843,33 @@ mod tests {
         } else {
             panic!("{}", format!("{metric_id} not found"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_set_durable_function_tag() {
+        let (metrics_aggr, my_config) = setup();
+        let mut lambda = Lambda::new(metrics_aggr.clone(), my_config);
+        let now: i64 = std::time::UNIX_EPOCH
+            .elapsed()
+            .expect("unable to poll clock, unrecoverable")
+            .as_secs()
+            .try_into()
+            .unwrap_or_default();
+
+        lambda.set_durable_function_tag();
+        lambda.increment_invocation_metric(now);
+
+        // Verify the metric was emitted with the durable_function:true tag
+        let ts = (now / 10) * 10;
+        let durable_tags = SortedTags::parse("durable_function:true").ok();
+        let entry = metrics_aggr
+            .get_entry_by_id(constants::INVOCATIONS_METRIC.into(), durable_tags, ts)
+            .await
+            .unwrap();
+        assert!(
+            entry.is_some(),
+            "Expected metric with durable_function:true tag"
+        );
     }
 
     #[tokio::test]
@@ -885,7 +919,10 @@ mod tests {
     async fn test_disabled() {
         let (metrics_aggr, no_config) = setup();
         let my_config = Arc::new(config::Config {
-            enhanced_metrics: false,
+            ext: config::LambdaConfig {
+                enhanced_metrics: false,
+                ..no_config.ext.clone()
+            },
             ..no_config.as_ref().clone()
         });
         let mut lambda = Lambda::new(metrics_aggr.clone(), my_config);
@@ -1356,7 +1393,10 @@ mod tests {
     async fn test_snapstart_restore_duration_metric_disabled() {
         let (metrics_aggr, no_config) = setup();
         let my_config = Arc::new(config::Config {
-            enhanced_metrics: false,
+            ext: config::LambdaConfig {
+                enhanced_metrics: false,
+                ..no_config.ext.clone()
+            },
             ..no_config.as_ref().clone()
         });
         let mut lambda = Lambda::new(metrics_aggr.clone(), my_config);

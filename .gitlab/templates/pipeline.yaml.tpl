@@ -1,9 +1,12 @@
+{{- $e2e_region := "us-west-2" -}}
+
 stages:
   - test
   - compile
   - build
   - integration-tests
   - self-monitoring
+  - e2e
   - sign
   - publish
 
@@ -52,9 +55,9 @@ bottlecap ({{ $flavor.name }}):
   image: registry.ddbuild.io/images/docker:20.10
   tags: ["arch:{{ $flavor.arch }}"]
   needs: []
-  # This job sometimes times out on GitLab for unclear reason.
-  # Set a short timeout with retries to work around this.
-  timeout: 10m
+  # This job sometimes times out on GitLab for unclear reasons.
+  # Set a timeout with retries to work around this.
+  timeout: 20m
   retry:
     max: 2
     when:
@@ -141,6 +144,7 @@ sign layer ({{ $flavor.name }}):
     - .gitlab/scripts/sign_layers.sh prod
 
 {{ range $environment_name, $environment := (ds "environments").environments }}
+{{- $dotenv := printf "%s_%s.env" $flavor.suffix $environment_name }}
 
 publish layer {{ $environment_name }} ({{ $flavor.name }}):
   stage: publish
@@ -172,12 +176,21 @@ publish layer {{ $environment_name }} ({{ $flavor.name }}):
       - REGION: {{ range (ds "regions").regions }}
           - {{ .code }}
         {{- end}}
+{{- if eq $environment_name "sandbox" }}
+  artifacts:
+    reports:
+      dotenv: {{ $dotenv }}
+{{- end }}
   variables:
     LAYER_NAME_BASE_SUFFIX: {{ $flavor.layer_name_base_suffix }}
     ARCHITECTURE: {{ $flavor.arch }}
     LAYER_FILE: datadog_extension-{{ $flavor.suffix }}.zip
     ADD_LAYER_VERSION_PERMISSIONS: {{ $environment.add_layer_version_permissions }}
     AUTOMATICALLY_BUMP_VERSION: {{ $environment.automatically_bump_version }}
+{{- if eq $environment_name "sandbox" }}
+    LAYER_DESCRIPTION: ${CI_COMMIT_SHORT_SHA}
+    DOTENV: {{ $dotenv }}
+{{- end }}
   before_script:
     - EXTERNAL_ID_NAME={{ $environment.external_id }} ROLE_TO_ASSUME={{ $environment.role_to_assume }} AWS_ACCOUNT={{ $environment.account }} source .gitlab/scripts/get_secrets.sh
   script:
@@ -185,6 +198,11 @@ publish layer {{ $environment_name }} ({{ $flavor.name }}):
 
 {{ end }} # end environments
 
+# Self-monitoring layer publishing — split by region/account inside one matrix:
+#   us-east-1 → serverless-testing account (093468662994), used by LOD/LMI
+#   us-west-2 → sandbox account (425362996713), used by E2E tests
+# Region-specific env values are injected per matrix row so the parallel jobs
+# still collapse into a single group in the GitLab UI.
 publish layer [self-monitoring] ({{ $flavor.name }}):
   stage: self-monitoring
   tags: ["arch:amd64"]
@@ -194,28 +212,112 @@ publish layer [self-monitoring] ({{ $flavor.name }}):
       allow_failure: true
   parallel:
     matrix:
-      - REGION: us-east-1 # Self Monitoring
-      - REGION: us-west-2 # E2E Testing
+      {{ with $environment := (ds "environments").environments.serverless_testing }}
+      - REGION: us-east-1
+        EXTERNAL_ID_NAME: {{ $environment.external_id }}
+        ROLE_TO_ASSUME: {{ $environment.role_to_assume }}
+        AWS_ACCOUNT: "{{ $environment.account }}"
+      {{ end }}
+      {{ with $environment := (ds "environments").environments.sandbox }}
+      - REGION: us-west-2
+        EXTERNAL_ID_NAME: {{ $environment.external_id }}
+        ROLE_TO_ASSUME: {{ $environment.role_to_assume }}
+        AWS_ACCOUNT: "{{ $environment.account }}"
+      {{ end }}
   needs:
     - layer ({{ $flavor.name }})
   dependencies:
     - layer ({{ $flavor.name }})
-  {{ with $environment := (ds "environments").environments.sandbox }}
   variables:
     LAYER_NAME_BASE_SUFFIX: {{ $flavor.layer_name_base_suffix }}
     ARCHITECTURE: {{ $flavor.arch }}
     LAYER_FILE: datadog_extension-{{ $flavor.suffix }}.zip
-    ADD_LAYER_VERSION_PERMISSIONS: {{ $environment.add_layer_version_permissions }}
-    AUTOMATICALLY_BUMP_VERSION: {{ $environment.automatically_bump_version }}
+    # Both target environments agree on these flags; if they ever diverge,
+    # move them into the matrix above alongside the account/role.
+    ADD_LAYER_VERSION_PERMISSIONS: 0
+    AUTOMATICALLY_BUMP_VERSION: 1
   before_script:
-    - EXTERNAL_ID_NAME={{ $environment.external_id }} ROLE_TO_ASSUME={{ $environment.role_to_assume }} AWS_ACCOUNT={{ $environment.account }} source .gitlab/scripts/get_secrets.sh
-  {{ end }}
+    - source .gitlab/scripts/get_secrets.sh
   script:
     - .gitlab/scripts/publish_layers.sh
 
 {{ end }} # end needs_layer_publish
 
 {{ end }}  # end flavors
+
+{{ range $f := (ds "flavors").flavors }}
+{{ if and $f.needs_layer_publish (eq $f.arch "amd64") }}
+{{- $dotenvE2E := printf "%s_sandbox_e2e.env" $f.suffix }}
+{{ with $environment := (ds "environments").environments.sandbox }}
+
+publish layer e2e sandbox ({{ $f.name }}):
+  stage: e2e
+  tags: ["arch:amd64"]
+  image: ${CI_DOCKER_TARGET_IMAGE}:${CI_DOCKER_TARGET_VERSION}
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v.*/'
+      when: on_success
+      variables:
+        LAYER_DESCRIPTION: $CI_COMMIT_TAG
+    - when: on_success
+      variables:
+        LAYER_DESCRIPTION: $CI_COMMIT_SHORT_SHA
+  needs:
+    - layer ({{ $f.name }})
+{{ if and (index $f "max_layer_compressed_size_mb") (index $f "max_layer_uncompressed_size_mb") }}
+    - check layer size ({{ $f.name }})
+{{ end }}
+  dependencies:
+    - layer ({{ $f.name }})
+  artifacts:
+    reports:
+      dotenv: {{ $dotenvE2E }}
+  variables:
+    LAYER_NAME_BASE_SUFFIX: {{ $f.layer_name_base_suffix }}
+    ARCHITECTURE: {{ $f.arch }}
+    LAYER_FILE: datadog_extension-{{ $f.suffix }}.zip
+    REGION: {{ $e2e_region }}
+    ADD_LAYER_VERSION_PERMISSIONS: {{ $environment.add_layer_version_permissions }}
+    AUTOMATICALLY_BUMP_VERSION: {{ $environment.automatically_bump_version }}
+    DOTENV: {{ $dotenvE2E }}
+  before_script:
+    - EXTERNAL_ID_NAME={{ $environment.external_id }} ROLE_TO_ASSUME={{ $environment.role_to_assume }} AWS_ACCOUNT={{ $environment.account }} source .gitlab/scripts/get_secrets.sh
+  script:
+    - .gitlab/scripts/publish_layers.sh
+
+e2e-test ({{ $f.name }}):
+  stage: e2e
+  trigger:
+    project: DataDog/serverless-e2e-tests
+    strategy: depend
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v.*/'
+      when: on_success
+      allow_failure: true
+    - when: on_success
+  needs:
+    - job: "publish layer e2e sandbox ({{ $f.name }})"
+      artifacts: true
+  variables:
+    EXTENSION_VERSION: $EXTENSION_LAYER_ARN
+    ARCHITECTURE: {{ $f.arch }}
+
+e2e-test-status ({{ $f.name }}):
+  stage: e2e
+  image: registry.ddbuild.io/images/docker:20.10-py3
+  tags: ["arch:amd64"]
+  timeout: 3h
+  variables:
+    E2E_JOB_NAME: "e2e-test ({{ $f.name }})"
+  needs:
+    - job: "publish layer e2e sandbox ({{ $f.name }})"
+      artifacts: false
+  script:
+    - .gitlab/scripts/poll_e2e.sh
+
+{{ end }}
+{{ end }}
+{{ end }}
 
 {{ range $multi_arch_image_flavor := (ds "flavors").multi_arch_image_flavors }}
 
@@ -235,7 +337,7 @@ publish private images ({{ $multi_arch_image_flavor.name }}):
   variables:
     SUFFIX: {{ $multi_arch_image_flavor.suffix }}
   before_script:
-    {{ with $environment := (ds "environments").environments.sandbox }}
+    {{ with $environment := (ds "environments").environments.serverless_testing }}
     - EXTERNAL_ID_NAME={{ $environment.external_id }} ROLE_TO_ASSUME={{ $environment.role_to_assume }} AWS_ACCOUNT={{ $environment.account }} source .gitlab/scripts/get_secrets.sh
     {{ end }}
   script:
@@ -403,6 +505,40 @@ build node lambdas:
     - cd integration-tests
     - ./scripts/build-node.sh
 
+build ruby lambdas:
+  stage: integration-tests
+  image: registry.ddbuild.io/images/docker:27.3.1
+  tags: ["docker-in-docker:arm64"]
+  rules:
+    - when: on_success
+  needs: []
+  artifacts:
+    expire_in: 1 hour
+    paths:
+      - integration-tests/lambda/*/*.rb
+  script:
+    - cd integration-tests
+    - ./scripts/build-ruby.sh
+
+build go lambdas:
+  stage: integration-tests
+  image: registry.ddbuild.io/images/docker:27.3.1
+  tags: ["docker-in-docker:arm64"]
+  rules:
+    - when: on_success
+  needs: []
+  cache:
+    key: go-mod-cache-${CI_COMMIT_REF_SLUG}
+    paths:
+      - integration-tests/.cache/go-mod/
+  artifacts:
+    expire_in: 1 hour
+    paths:
+      - integration-tests/lambda/*/bin/bootstrap
+  script:
+    - cd integration-tests
+    - ./scripts/build-go.sh
+
 # Integration Tests - Publish arm64 layer with integration test prefix
 publish integration layer (arm64):
   stage: integration-tests
@@ -464,6 +600,7 @@ integration-suite:
   stage: integration-tests
   tags: ["arch:amd64"]
   image: ${CI_DOCKER_TARGET_IMAGE}:${CI_DOCKER_TARGET_VERSION}
+  retry: 2
   parallel:
     matrix:
       - TEST_SUITE: {{ range (ds "test_suites").test_suites }}
@@ -478,14 +615,18 @@ integration-suite:
     - build dotnet lambdas
     - build python lambdas
     - build node lambdas
+    - build ruby lambdas
+    - build go lambdas
   dependencies:
     - publish integration layer (arm64)
     - build java lambdas
     - build dotnet lambdas
     - build python lambdas
     - build node lambdas
+    - build ruby lambdas
+    - build go lambdas
   variables:
-    IDENTIFIER: ${CI_COMMIT_SHORT_SHA}
+    IDENTIFIER: it-${CI_COMMIT_SHORT_SHA}-${CI_JOB_ID}
     AWS_DEFAULT_REGION: us-east-1
     DD_SITE: datadoghq.com
   {{ with $environment := (ds "environments").environments.sandbox }}
@@ -508,7 +649,7 @@ integration-suite:
     - export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
     - export CDK_DEFAULT_REGION=us-east-1
     - npm run build
-    - npx cdk deploy "integ-${IDENTIFIER}-${TEST_SUITE}" --require-approval never
+    - npx cdk deploy "${IDENTIFIER}-${TEST_SUITE}" --require-approval never --import-existing-resources
     - echo "Running ${TEST_SUITE} integration tests with identifier ${IDENTIFIER}..."
     - export TEST_SUITE=${TEST_SUITE}
     - npx jest tests/${TEST_SUITE}.test.ts
@@ -517,7 +658,7 @@ integration-suite:
     - EXTERNAL_ID_NAME={{ $environment.external_id }} ROLE_TO_ASSUME={{ $environment.role_to_assume }} AWS_ACCOUNT={{ $environment.account }} source .gitlab/scripts/get_secrets.sh
     - echo "Destroying ${TEST_SUITE} CDK stack with identifier ${IDENTIFIER}..."
     - |
-      STACK_NAME="integ-${IDENTIFIER}-${TEST_SUITE}"
+      STACK_NAME="${IDENTIFIER}-${TEST_SUITE}"
 
       # Check if stack exists
       STACK_STATUS=$(aws cloudformation describe-stacks \

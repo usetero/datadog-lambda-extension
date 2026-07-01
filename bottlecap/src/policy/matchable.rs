@@ -103,6 +103,10 @@ mod tests {
                 lambda: Lambda {
                     arn: "arn:aws:lambda:us-east-1:123456789:function:test".to_string(),
                     request_id: Some("req-123".to_string()),
+                    durable_execution_id: None,
+                    durable_execution_name: None,
+                    first_invocation: None,
+                    durable_execution_status: None,
                 },
                 timestamp: 1_234_567_890,
                 status: "info".to_string(),

@@ -1,7 +1,6 @@
 // Copyright 2023-Present Datadog, Inc. https://www.datadoghq.com/
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod context;
 pub mod http_client;
 pub mod propagation;
 pub mod proxy_aggregator;
@@ -39,7 +38,7 @@ const DNS_LOCAL_HOST_ADDRESS_URL_PREFIX: &str = "127.0.0.1";
 const AWS_XRAY_DAEMON_ADDRESS_URL_PREFIX: &str = "169.254.79.129";
 
 // Name of the placeholder invocation span set by Java and Go tracers
-const INVOCATION_SPAN_RESOURCE: &str = "dd-tracer-serverless-span";
+pub(crate) const INVOCATION_SPAN_RESOURCE: &str = "dd-tracer-serverless-span";
 
 #[allow(clippy::doc_markdown)]
 /// Header used for additional tags when sending APM data to the Datadog intake
