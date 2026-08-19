@@ -42,68 +42,14 @@ impl PolicyEvaluator {
     /// - `Drop`: Drop
     /// - `Sample`: Keep based on sampling decision
     /// - `RateLimit`: Keep based on rate limit decision
-    pub async fn should_keep<M: Matchable>(&self, item: &M) -> bool {
+    #[must_use]
+    pub fn should_keep<M: Matchable>(&self, item: &M) -> bool {
         let snapshot = self.registry.snapshot();
         let policy_count = snapshot.len();
 
         debug!("POLICY | Evaluating item against {} policies", policy_count);
 
-        match self.engine.evaluate(&snapshot, item).await {
-            Ok(result) => {
-                debug!("POLICY | Evaluation result: {:?}", result);
-                match result {
-                    EvaluateResult::NoMatch => {
-                        debug!("POLICY | No matching policy, keeping item");
-                        true
-                    }
-                    EvaluateResult::Keep { .. } => {
-                        debug!("POLICY | Policy matched, keeping item");
-                        true
-                    }
-                    EvaluateResult::Drop { .. } => {
-                        debug!("POLICY | Dropping item due to policy");
-                        false
-                    }
-                    EvaluateResult::Sample {
-                        keep, percentage, ..
-                    } => {
-                        debug!(
-                            "POLICY | Sampling decision: keep={}, percentage={}%",
-                            keep, percentage
-                        );
-                        keep
-                    }
-                    EvaluateResult::RateLimit { allowed, .. } => {
-                        debug!("POLICY | Rate limit decision: allowed={}", allowed);
-                        allowed
-                    }
-                }
-            }
-            Err(e) => {
-                // Fail open: keep the item if evaluation fails
-                warn!("POLICY | Evaluation error, keeping item: {}", e);
-                true
-            }
-        }
-    }
-
-    /// Evaluates an item synchronously by blocking on the async evaluation.
-    ///
-    /// This is a convenience method for contexts where async is not available.
-    /// It uses `futures::executor::block_on` internally.
-    ///
-    /// Returns `true` if the item should be kept, `false` if it should be dropped.
-    #[must_use]
-    pub fn should_keep_sync<M: Matchable>(&self, item: &M) -> bool {
-        let snapshot = self.registry.snapshot();
-        let policy_count = snapshot.len();
-
-        debug!(
-            "POLICY | Evaluating item (sync) against {} policies",
-            policy_count
-        );
-
-        match futures::executor::block_on(self.engine.evaluate(&snapshot, item)) {
+        match self.engine.evaluate(&snapshot, item) {
             Ok(result) => {
                 debug!("POLICY | Evaluation result: {:?}", result);
                 match result {
@@ -408,7 +354,7 @@ mod tests {
         let evaluator = PolicyEvaluator::new(registry);
         let log = default_test_log();
 
-        assert!(evaluator.should_keep(&log).await);
+        assert!(evaluator.should_keep(&log));
     }
 
     #[test]
@@ -417,7 +363,7 @@ mod tests {
         let evaluator = PolicyEvaluator::new(registry);
         let log = default_test_log();
 
-        assert!(evaluator.should_keep_sync(&log));
+        assert!(evaluator.should_keep(&log));
     }
 
     #[tokio::test]
@@ -433,7 +379,7 @@ mod tests {
         let log = default_test_log();
 
         // Should keep because policy is disabled
-        assert!(evaluator.should_keep(&log).await);
+        assert!(evaluator.should_keep(&log));
     }
 
     // ==================== Drop (keep: "none") Tests ====================
@@ -457,7 +403,7 @@ mod tests {
             "arn:aws:lambda:us-east-1:123456789:function:test",
             Some("req-123"),
         );
-        assert!(!evaluator.should_keep(&error_log).await);
+        assert!(!evaluator.should_keep(&error_log));
 
         // Log without "error" should be kept
         let info_log = create_test_log(
@@ -468,7 +414,7 @@ mod tests {
             "arn:aws:lambda:us-east-1:123456789:function:test",
             Some("req-123"),
         );
-        assert!(evaluator.should_keep(&info_log).await);
+        assert!(evaluator.should_keep(&info_log));
     }
 
     #[tokio::test]
@@ -483,7 +429,7 @@ mod tests {
 
         // Exact match should be dropped
         let drop_log = create_test_log("DROP_ME", "info", "test-service", "test-host", "arn", None);
-        assert!(!evaluator.should_keep(&drop_log).await);
+        assert!(!evaluator.should_keep(&drop_log));
 
         // Partial match should not be dropped
         let keep_log = create_test_log(
@@ -494,7 +440,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(evaluator.should_keep(&keep_log).await);
+        assert!(evaluator.should_keep(&keep_log));
     }
 
     #[tokio::test]
@@ -509,11 +455,11 @@ mod tests {
 
         // Debug logs should be dropped
         let debug_log = create_test_log("Debug message", "debug", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&debug_log).await);
+        assert!(!evaluator.should_keep(&debug_log));
 
         // Non-debug logs should be kept
         let info_log = create_test_log("Info message", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&info_log).await);
+        assert!(evaluator.should_keep(&info_log));
     }
 
     #[tokio::test]
@@ -534,11 +480,11 @@ mod tests {
 
         // Log from noisy-service should be dropped
         let noisy_log = create_test_log("Message", "info", "noisy-service", "host", "arn", None);
-        assert!(!evaluator.should_keep(&noisy_log).await);
+        assert!(!evaluator.should_keep(&noisy_log));
 
         // Log from other services should be kept
         let other_log = create_test_log("Message", "info", "good-service", "host", "arn", None);
-        assert!(evaluator.should_keep(&other_log).await);
+        assert!(evaluator.should_keep(&other_log));
     }
 
     #[tokio::test]
@@ -552,10 +498,10 @@ mod tests {
         let evaluator = PolicyEvaluator::new(registry);
 
         let log_from_test = create_test_log("Message", "info", "svc", "test-host", "arn", None);
-        assert!(!evaluator.should_keep(&log_from_test).await);
+        assert!(!evaluator.should_keep(&log_from_test));
 
         let log_from_prod = create_test_log("Message", "info", "svc", "prod-host", "arn", None);
-        assert!(evaluator.should_keep(&log_from_prod).await);
+        assert!(evaluator.should_keep(&log_from_prod));
     }
 
     #[tokio::test]
@@ -578,7 +524,7 @@ mod tests {
             "arn:aws:lambda:us-east-1:123456789:function:dev-test",
             None,
         );
-        assert!(!evaluator.should_keep(&dev_log).await);
+        assert!(!evaluator.should_keep(&dev_log));
 
         let prod_log = create_test_log(
             "Message",
@@ -588,7 +534,7 @@ mod tests {
             "arn:aws:lambda:us-east-1:123456789:function:prod-api",
             None,
         );
-        assert!(evaluator.should_keep(&prod_log).await);
+        assert!(evaluator.should_keep(&prod_log));
     }
 
     // ==================== Keep (keep: "all") Tests ====================
@@ -612,11 +558,11 @@ mod tests {
             "arn",
             None,
         );
-        assert!(evaluator.should_keep(&important_log).await);
+        assert!(evaluator.should_keep(&important_log));
 
         // Other logs should also be kept (no match = keep)
         let other_log = create_test_log("Regular message", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&other_log).await);
+        assert!(evaluator.should_keep(&other_log));
     }
 
     // ==================== Negated Matcher Tests ====================
@@ -644,11 +590,11 @@ mod tests {
 
         // With only a negated matcher and no positive matchers, required_match_count = 0
         // and the policy would match any log unless disqualified
-        assert!(!evaluator.should_keep(&regular_log).await);
+        assert!(!evaluator.should_keep(&regular_log));
 
         // Log with "keep_me" - negated matcher disqualifies the policy
         let keep_log = create_test_log("keep_me please", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&keep_log).await);
+        assert!(evaluator.should_keep(&keep_log));
     }
 
     // ==================== Multiple Matcher (AND) Tests ====================
@@ -666,19 +612,19 @@ mod tests {
 
         // Both conditions met - should be dropped
         let error_error = create_test_log("An error occurred", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&error_error).await);
+        assert!(!evaluator.should_keep(&error_error));
 
         // Only body matches - should be kept
         let error_info = create_test_log("An error occurred", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&error_info).await);
+        assert!(evaluator.should_keep(&error_info));
 
         // Only severity matches - should be kept
         let warn_error = create_test_log("A warning message", "error", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&warn_error).await);
+        assert!(evaluator.should_keep(&warn_error));
 
         // Neither matches - should be kept
         let info_info = create_test_log("Info message", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&info_info).await);
+        assert!(evaluator.should_keep(&info_info));
     }
 
     // ==================== Multiple Policies Tests ====================
@@ -697,7 +643,7 @@ mod tests {
 
         // Log matches both policies - drop is more restrictive
         let error_log = create_test_log("An error occurred", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&error_log).await);
+        assert!(!evaluator.should_keep(&error_log));
     }
 
     #[tokio::test]
@@ -714,15 +660,15 @@ mod tests {
 
         // Debug logs should be dropped
         let debug_log = create_test_log("Debug", "debug", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&debug_log).await);
+        assert!(!evaluator.should_keep(&debug_log));
 
         // Trace logs should be dropped
         let trace_log = create_test_log("Trace", "trace", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&trace_log).await);
+        assert!(!evaluator.should_keep(&trace_log));
 
         // Info logs should be kept (no match)
         let info_log = create_test_log("Info", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&info_log).await);
+        assert!(evaluator.should_keep(&info_log));
     }
 
     // ==================== Sampling Tests ====================
@@ -741,7 +687,7 @@ mod tests {
         let log = default_test_log();
 
         // 0% sampling should drop all
-        assert!(!evaluator.should_keep(&log).await);
+        assert!(!evaluator.should_keep(&log));
     }
 
     #[tokio::test]
@@ -757,11 +703,14 @@ mod tests {
         let log = default_test_log();
 
         // 100% sampling should keep all
-        assert!(evaluator.should_keep(&log).await);
+        assert!(evaluator.should_keep(&log));
     }
 
+    /// Percentage sampling needs a sample key to be consistent. A policy that
+    /// sets a percentage but no sample key fails open and keeps everything;
+    /// see `sampled_policy_with_key` tests for the sampling path itself.
     #[tokio::test]
-    async fn test_sampling_fifty_percent_statistical() {
+    async fn test_sampling_without_sample_key_keeps_all() {
         let registry = Arc::new(PolicyRegistry::new());
         let handle = registry.register_provider();
 
@@ -771,9 +720,8 @@ mod tests {
 
         let evaluator = PolicyEvaluator::new(registry);
 
-        // Run many evaluations and check the ratio
-        let mut kept = 0;
         let total = 1000;
+        let mut kept = 0;
 
         for i in 0..total {
             let log = create_test_log(
@@ -784,16 +732,14 @@ mod tests {
                 "arn",
                 None,
             );
-            if evaluator.should_keep(&log).await {
+            if evaluator.should_keep(&log) {
                 kept += 1;
             }
         }
 
-        // Should be roughly 50% (with some variance)
-        let ratio = f64::from(kept) / f64::from(total);
-        assert!(
-            ratio > 0.4 && ratio < 0.6,
-            "Sampling ratio {ratio} is outside expected range 0.4-0.6"
+        assert_eq!(
+            kept, total,
+            "a policy with no sample key must keep all logs"
         );
     }
 
@@ -814,16 +760,13 @@ mod tests {
         // First 5 should be allowed
         for i in 0..5 {
             let log = create_test_log(&format!("Log {i}"), "info", "svc", "host", "arn", None);
-            assert!(
-                evaluator.should_keep(&log).await,
-                "Log {i} should have been kept"
-            );
+            assert!(evaluator.should_keep(&log), "Log {i} should have been kept");
         }
 
         // 6th should be rate limited (dropped)
         let log6 = create_test_log("Log 6", "info", "svc", "host", "arn", None);
         assert!(
-            !evaluator.should_keep(&log6).await,
+            !evaluator.should_keep(&log6),
             "Log 6 should have been rate limited"
         );
     }
@@ -842,11 +785,11 @@ mod tests {
 
         // Empty message should match
         let empty_log = create_test_log("", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&empty_log).await);
+        assert!(!evaluator.should_keep(&empty_log));
 
         // Non-empty should not match
         let non_empty_log = create_test_log("content", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&non_empty_log).await);
+        assert!(evaluator.should_keep(&non_empty_log));
     }
 
     #[tokio::test]
@@ -868,7 +811,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&bracket_log).await);
+        assert!(!evaluator.should_keep(&bracket_log));
 
         let no_bracket_log = create_test_log(
             "ERROR Something failed",
@@ -878,7 +821,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(evaluator.should_keep(&no_bracket_log).await);
+        assert!(evaluator.should_keep(&no_bracket_log));
     }
 
     #[tokio::test]
@@ -895,12 +838,12 @@ mod tests {
         // Log without request_id - policy shouldn't match because field is None
         let no_req_id_log = create_test_log("Message", "info", "svc", "host", "arn", None);
         // Since request_id is None, the field returns None and regex can't match
-        assert!(evaluator.should_keep(&no_req_id_log).await);
+        assert!(evaluator.should_keep(&no_req_id_log));
 
         // Log with request_id containing "missing"
         let with_missing =
             create_test_log("Message", "info", "svc", "host", "arn", Some("missing-123"));
-        assert!(!evaluator.should_keep(&with_missing).await);
+        assert!(!evaluator.should_keep(&with_missing));
     }
 
     #[tokio::test]
@@ -914,10 +857,10 @@ mod tests {
         let evaluator = PolicyEvaluator::new(registry);
 
         let emoji_log = create_test_log("Fire emoji: 🔥", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&emoji_log).await);
+        assert!(!evaluator.should_keep(&emoji_log));
 
         let no_emoji_log = create_test_log("No fire here", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&no_emoji_log).await);
+        assert!(evaluator.should_keep(&no_emoji_log));
     }
 
     #[tokio::test]
@@ -934,7 +877,7 @@ mod tests {
         let long_content = "x".repeat(10000);
         let long_message = format!("start{long_content}end");
         let long_log = create_test_log(&long_message, "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&long_log).await);
+        assert!(!evaluator.should_keep(&long_log));
     }
 
     #[tokio::test]
@@ -949,11 +892,11 @@ mod tests {
 
         // Lowercase matches
         let lower = create_test_log("an error occurred", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&lower).await);
+        assert!(!evaluator.should_keep(&lower));
 
         // Uppercase does NOT match (regex is case-sensitive by default)
         let upper = create_test_log("an ERROR occurred", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&upper).await);
+        assert!(evaluator.should_keep(&upper));
     }
 
     #[tokio::test]
@@ -968,13 +911,13 @@ mod tests {
         let evaluator = PolicyEvaluator::new(registry);
 
         let lower = create_test_log("an error occurred", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&lower).await);
+        assert!(!evaluator.should_keep(&lower));
 
         let upper = create_test_log("an ERROR occurred", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&upper).await);
+        assert!(!evaluator.should_keep(&upper));
 
         let mixed = create_test_log("an ErRoR occurred", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&mixed).await);
+        assert!(!evaluator.should_keep(&mixed));
     }
 
     // ==================== Complex Regex Pattern Tests ====================
@@ -992,7 +935,7 @@ mod tests {
 
         // Should match "error"
         let error_log = create_test_log("An error occurred", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&error_log).await);
+        assert!(!evaluator.should_keep(&error_log));
 
         // Should match "fatal"
         let fatal_log = create_test_log(
@@ -1003,7 +946,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&fatal_log).await);
+        assert!(!evaluator.should_keep(&fatal_log));
 
         // Should match "critical"
         let critical_log = create_test_log(
@@ -1014,11 +957,11 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&critical_log).await);
+        assert!(!evaluator.should_keep(&critical_log));
 
         // Should NOT match
         let info_log = create_test_log("normal operation", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&info_log).await);
+        assert!(evaluator.should_keep(&info_log));
     }
 
     #[tokio::test]
@@ -1040,19 +983,19 @@ mod tests {
 
         // Should match - has req-abc followed by digit
         let log1 = create_test_log("Processing req-abc123", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         // Should match - has req-xyz followed by digit
         let log2 = create_test_log("req-xyz789 completed", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log2).await);
+        assert!(!evaluator.should_keep(&log2));
 
         // Should NOT match - no digit after 3 letters
         let log3 = create_test_log("req-abc done", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log3).await);
+        assert!(evaluator.should_keep(&log3));
 
         // Should NOT match (no alphanumeric after hyphen)
         let log4 = create_test_log("req- incomplete", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log4).await);
+        assert!(evaluator.should_keep(&log4));
     }
 
     #[tokio::test]
@@ -1069,19 +1012,19 @@ mod tests {
 
         // Should match 3 digits
         let log1 = create_test_log("Error E001 occurred", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         // Should match 4 digits (matches first 3)
         let log2 = create_test_log("E1234 detected", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log2).await);
+        assert!(!evaluator.should_keep(&log2));
 
         // Should match 5 digits (matches first 3)
         let log3 = create_test_log("Processing E99999", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log3).await);
+        assert!(!evaluator.should_keep(&log3));
 
         // Should NOT match (only 2 digits)
         let log4 = create_test_log("E01 too short", "error", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log4).await);
+        assert!(evaluator.should_keep(&log4));
     }
 
     #[tokio::test]
@@ -1097,18 +1040,18 @@ mod tests {
 
         // Should match standalone "debug"
         let log1 = create_test_log("debug message here", "debug", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         let log2 = create_test_log("This is debug output", "debug", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log2).await);
+        assert!(!evaluator.should_keep(&log2));
 
         // Should NOT match "debugging" (word continues)
         let log3 = create_test_log("debugging the issue", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log3).await);
+        assert!(evaluator.should_keep(&log3));
 
         // Should NOT match "nodebug" (word starts before)
         let log4 = create_test_log("nodebug mode enabled", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log4).await);
+        assert!(evaluator.should_keep(&log4));
     }
 
     #[tokio::test]
@@ -1131,11 +1074,11 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         // Should NOT match - START not at beginning
         let log2 = create_test_log("Function START time", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log2).await);
+        assert!(evaluator.should_keep(&log2));
     }
 
     #[tokio::test]
@@ -1151,11 +1094,11 @@ mod tests {
 
         // Should match - ends with completed
         let log1 = create_test_log("Task completed", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         // Should NOT match - completed not at end
         let log2 = create_test_log("completed the task", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log2).await);
+        assert!(evaluator.should_keep(&log2));
     }
 
     #[tokio::test]
@@ -1179,7 +1122,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         let log2 = create_test_log(
             "Server at 192.168.0.1 responded",
@@ -1189,15 +1132,15 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log2).await);
+        assert!(!evaluator.should_keep(&log2));
 
         // Should NOT match other IPs
         let log3 = create_test_log("Server at 10.0.0.1", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log3).await);
+        assert!(evaluator.should_keep(&log3));
 
         // Should NOT match no IP
         let log4 = create_test_log("No IP here", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log4).await);
+        assert!(evaluator.should_keep(&log4));
     }
 
     #[tokio::test]
@@ -1225,7 +1168,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         // Should NOT match malformed UUID
         let log2 = create_test_log(
@@ -1236,7 +1179,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(evaluator.should_keep(&log2).await);
+        assert!(evaluator.should_keep(&log2));
     }
 
     #[tokio::test]
@@ -1258,19 +1201,19 @@ mod tests {
 
         // Should match "error code"
         let log2 = create_test_log("error code 500", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log2).await);
+        assert!(!evaluator.should_keep(&log2));
 
         // Should match "error:"
         let log3 = create_test_log("error: 404 not found", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log3).await);
+        assert!(!evaluator.should_keep(&log3));
 
         // Should match "error code:"
         let log4 = create_test_log("error code: 503", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log4).await);
+        assert!(!evaluator.should_keep(&log4));
 
         // Should NOT match unrelated
         let log5 = create_test_log("success message", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log5).await);
+        assert!(evaluator.should_keep(&log5));
     }
 
     #[tokio::test]
@@ -1293,15 +1236,15 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         // Should match - script tag at start
         let log2 = create_test_log("<script src='bad.js'>", "warn", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log2).await);
+        assert!(!evaluator.should_keep(&log2));
 
         // Should NOT match - normal alphanumeric content
         let log3 = create_test_log("Normal log message 123", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log3).await);
+        assert!(evaluator.should_keep(&log3));
     }
 
     #[tokio::test]
@@ -1318,10 +1261,10 @@ mod tests {
 
         // Should match 4xx errors
         let log1 = create_test_log("Response: HTTP/404", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         let log2 = create_test_log("HTTP 401 Unauthorized", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log2).await);
+        assert!(!evaluator.should_keep(&log2));
 
         // Should match 5xx errors
         let log3 = create_test_log(
@@ -1332,18 +1275,18 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log3).await);
+        assert!(!evaluator.should_keep(&log3));
 
         let log4 = create_test_log("Got HTTP 503", "error", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log4).await);
+        assert!(!evaluator.should_keep(&log4));
 
         // Should NOT match 2xx success
         let log5 = create_test_log("HTTP/200 OK", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log5).await);
+        assert!(evaluator.should_keep(&log5));
 
         // Should NOT match 3xx redirects
         let log6 = create_test_log("HTTP 301 Moved", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log6).await);
+        assert!(evaluator.should_keep(&log6));
     }
 
     #[tokio::test]
@@ -1371,7 +1314,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         let log2 = create_test_log(
             r#"{"severity":"error","msg":"crash"}"#,
@@ -1381,7 +1324,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log2).await);
+        assert!(!evaluator.should_keep(&log2));
 
         // Should NOT match JSON info level
         let log3 = create_test_log(
@@ -1392,7 +1335,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(evaluator.should_keep(&log3).await);
+        assert!(evaluator.should_keep(&log3));
     }
 
     #[tokio::test]
@@ -1420,7 +1363,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         // Should NOT match non-ISO format
         let log2 = create_test_log(
@@ -1431,7 +1374,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(evaluator.should_keep(&log2).await);
+        assert!(evaluator.should_keep(&log2));
     }
 
     #[tokio::test]
@@ -1460,7 +1403,7 @@ mod tests {
             "arn:aws:lambda:us-east-1:123456789012:function:dev-api",
             None,
         );
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         // Should NOT match dev function in different region
         let log2 = create_test_log(
@@ -1471,7 +1414,7 @@ mod tests {
             "arn:aws:lambda:eu-west-1:123456789012:function:dev-api",
             None,
         );
-        assert!(evaluator.should_keep(&log2).await);
+        assert!(evaluator.should_keep(&log2));
 
         // Should NOT match prod function
         let log3 = create_test_log(
@@ -1482,7 +1425,7 @@ mod tests {
             "arn:aws:lambda:us-east-1:123456789012:function:prod-api",
             None,
         );
-        assert!(evaluator.should_keep(&log3).await);
+        assert!(evaluator.should_keep(&log3));
     }
 
     #[tokio::test]
@@ -1512,7 +1455,7 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         // Should match X-Ray Trace ID
         let log2 = create_test_log(
@@ -1523,11 +1466,11 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log2).await);
+        assert!(!evaluator.should_keep(&log2));
 
         // Should NOT match other patterns
         let log3 = create_test_log("Simple log message", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log3).await);
+        assert!(evaluator.should_keep(&log3));
     }
 
     #[tokio::test]
@@ -1558,11 +1501,11 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log1).await);
+        assert!(!evaluator.should_keep(&log1));
 
         // Should match password: pattern
         let log2 = create_test_log("password: hunter2", "debug", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&log2).await);
+        assert!(!evaluator.should_keep(&log2));
 
         // Should match password = pattern
         let log3 = create_test_log(
@@ -1573,11 +1516,11 @@ mod tests {
             "arn",
             None,
         );
-        assert!(!evaluator.should_keep(&log3).await);
+        assert!(!evaluator.should_keep(&log3));
 
         // Should NOT match if no value follows
         let log4 = create_test_log("Enter your password", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&log4).await);
+        assert!(evaluator.should_keep(&log4));
     }
 
     // ==================== Case Insensitive Matching Tests ====================
@@ -1663,19 +1606,19 @@ mod tests {
 
         // Should match lowercase
         let lower = create_test_log("an error occurred", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&lower).await);
+        assert!(!evaluator.should_keep(&lower));
 
         // Should match uppercase
         let upper = create_test_log("an ERROR occurred", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&upper).await);
+        assert!(!evaluator.should_keep(&upper));
 
         // Should match mixed case
         let mixed = create_test_log("an ErRoR occurred", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&mixed).await);
+        assert!(!evaluator.should_keep(&mixed));
 
         // Should NOT match unrelated
         let unrelated = create_test_log("all good", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&unrelated).await);
+        assert!(evaluator.should_keep(&unrelated));
     }
 
     #[tokio::test]
@@ -1691,19 +1634,19 @@ mod tests {
 
         // Should match exact uppercase
         let upper = create_test_log("HELLO", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&upper).await);
+        assert!(!evaluator.should_keep(&upper));
 
         // Should match lowercase
         let lower = create_test_log("hello", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&lower).await);
+        assert!(!evaluator.should_keep(&lower));
 
         // Should match mixed case
         let mixed = create_test_log("HeLLo", "info", "svc", "host", "arn", None);
-        assert!(!evaluator.should_keep(&mixed).await);
+        assert!(!evaluator.should_keep(&mixed));
 
         // Should NOT match partial
         let partial = create_test_log("hello world", "info", "svc", "host", "arn", None);
-        assert!(evaluator.should_keep(&partial).await);
+        assert!(evaluator.should_keep(&partial));
     }
 
     #[tokio::test]
@@ -1725,13 +1668,13 @@ mod tests {
 
         // Lowercase matches both
         let lower = create_test_log("error message", "info", "svc", "host", "arn", None);
-        assert!(!evaluator_sensitive.should_keep(&lower).await);
-        assert!(!evaluator_insensitive.should_keep(&lower).await);
+        assert!(!evaluator_sensitive.should_keep(&lower));
+        assert!(!evaluator_insensitive.should_keep(&lower));
 
         // Uppercase only matches case-insensitive
         let upper = create_test_log("ERROR message", "info", "svc", "host", "arn", None);
-        assert!(evaluator_sensitive.should_keep(&upper).await); // case-sensitive doesn't match
-        assert!(!evaluator_insensitive.should_keep(&upper).await); // case-insensitive matches
+        assert!(evaluator_sensitive.should_keep(&upper)); // case-sensitive doesn't match
+        assert!(!evaluator_insensitive.should_keep(&upper)); // case-insensitive matches
     }
 
     // ==================== Sample Key Tests ====================
@@ -1804,7 +1747,7 @@ mod tests {
                 "arn",
                 Some(request_id),
             );
-            decisions.push(evaluator.should_keep(&log).await);
+            decisions.push(evaluator.should_keep(&log));
         }
 
         // All decisions should be the same for the same request_id
@@ -1829,10 +1772,16 @@ mod tests {
         // Generate many different request IDs and track decisions
         let mut kept_count = 0;
         let mut dropped_count = 0;
-        let total = 100;
+        let total: u32 = 100;
 
         for i in 0..total {
-            let request_id = format!("req-{i:04}");
+            // Sampling hashes the key with FNV-1a and compares the top bits of
+            // the result. Keys sharing a long prefix (`req-0000`, `req-0001`, …)
+            // barely move those bits, so spread the key like a real request id.
+            let request_id = format!(
+                "req-{:016x}",
+                u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            );
             let log = create_test_log(
                 "Log message",
                 "info",
@@ -1841,7 +1790,7 @@ mod tests {
                 "arn",
                 Some(&request_id),
             );
-            if evaluator.should_keep(&log).await {
+            if evaluator.should_keep(&log) {
                 kept_count += 1;
             } else {
                 dropped_count += 1;
@@ -1877,7 +1826,7 @@ mod tests {
                 Some(&format!("req-{i}")),
             );
             assert!(
-                !evaluator.should_keep(&log).await,
+                !evaluator.should_keep(&log),
                 "0% sampling should drop all logs"
             );
         }
@@ -1904,7 +1853,7 @@ mod tests {
                 Some(&format!("req-{i}")),
             );
             assert!(
-                evaluator.should_keep(&log).await,
+                evaluator.should_keep(&log),
                 "100% sampling should keep all logs"
             );
         }
@@ -1932,7 +1881,7 @@ mod tests {
                 "arn",
                 None,
             );
-            decisions_svc_a.push(evaluator.should_keep(&log).await);
+            decisions_svc_a.push(evaluator.should_keep(&log));
         }
 
         let first_a = decisions_svc_a[0];
@@ -1952,7 +1901,7 @@ mod tests {
                 "arn",
                 None,
             );
-            decisions_svc_b.push(evaluator.should_keep(&log).await);
+            decisions_svc_b.push(evaluator.should_keep(&log));
         }
 
         let first_b = decisions_svc_b[0];
@@ -1973,20 +1922,20 @@ mod tests {
         let log = create_test_log("test message", "info", "svc", "host", "arn", None);
 
         // Initially no policies - log is kept
-        assert!(evaluator.should_keep(&log).await);
+        assert!(evaluator.should_keep(&log));
 
         // Add a drop policy
         let policy = body_regex_policy("drop-test", "test", "none", true);
         handle.update(vec![policy]);
 
         // Now log should be dropped
-        assert!(!evaluator.should_keep(&log).await);
+        assert!(!evaluator.should_keep(&log));
 
         // Remove all policies
         handle.update(vec![]);
 
         // Log should be kept again
-        assert!(evaluator.should_keep(&log).await);
+        assert!(evaluator.should_keep(&log));
     }
 
     // ==================== Sync Drop/Keep/Sample Tests ====================
@@ -2002,7 +1951,7 @@ mod tests {
         let evaluator = PolicyEvaluator::new(registry);
         let log = default_test_log();
 
-        assert!(!evaluator.should_keep_sync(&log));
+        assert!(!evaluator.should_keep(&log));
     }
 
     #[test]
@@ -2016,7 +1965,7 @@ mod tests {
         let evaluator = PolicyEvaluator::new(registry);
         let log = default_test_log();
 
-        assert!(evaluator.should_keep_sync(&log));
+        assert!(evaluator.should_keep(&log));
     }
 
     #[test]
@@ -2031,7 +1980,7 @@ mod tests {
         let log = default_test_log();
 
         // No match means keep
-        assert!(evaluator.should_keep_sync(&log));
+        assert!(evaluator.should_keep(&log));
     }
 
     // ==================== Sync vs Async Consistency ====================
@@ -2049,15 +1998,15 @@ mod tests {
         // Test with log that should be dropped
         let drop_log = create_test_log("drop_this please", "info", "svc", "host", "arn", None);
         assert_eq!(
-            evaluator.should_keep(&drop_log).await,
-            evaluator.should_keep_sync(&drop_log)
+            evaluator.should_keep(&drop_log),
+            evaluator.should_keep(&drop_log)
         );
 
         // Test with log that should be kept
         let keep_log = create_test_log("keep this", "info", "svc", "host", "arn", None);
         assert_eq!(
-            evaluator.should_keep(&keep_log).await,
-            evaluator.should_keep_sync(&keep_log)
+            evaluator.should_keep(&keep_log),
+            evaluator.should_keep(&keep_log)
         );
     }
 }

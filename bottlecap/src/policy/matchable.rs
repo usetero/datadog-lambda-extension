@@ -6,13 +6,15 @@
 
 use std::borrow::Cow;
 
-use policy_rs::proto::tero::policy::v1::LogField;
-use policy_rs::{LogFieldSelector, Matchable};
+use policy_rs::proto::tero::policy::v1::{LogField, TraceField};
+use policy_rs::{LogFieldSelector, LogSignal, Matchable, TraceFieldSelector, TraceSignal};
 
 use crate::logs::lambda::IntakeLog;
 use libdd_trace_protobuf::pb;
 
 impl Matchable for IntakeLog {
+    type Signal = LogSignal;
+
     fn get_field(&self, field: &LogFieldSelector) -> Option<Cow<'_, str>> {
         match field {
             LogFieldSelector::Simple(simple) => match simple {
@@ -57,13 +59,12 @@ impl Matchable for IntakeLog {
 pub struct SpanWrapper<'a>(pub &'a pb::Span);
 
 impl Matchable for SpanWrapper<'_> {
-    fn get_field(&self, field: &LogFieldSelector) -> Option<Cow<'_, str>> {
+    type Signal = TraceSignal;
+
+    fn get_field(&self, field: &TraceFieldSelector) -> Option<Cow<'_, str>> {
         match field {
-            LogFieldSelector::Simple(simple) => match simple {
-                LogField::Body => Some(Cow::Borrowed(&self.0.resource)),
-                _ => None,
-            },
-            LogFieldSelector::ResourceAttribute(key) => {
+            TraceFieldSelector::Simple(TraceField::Name) => Some(Cow::Borrowed(&self.0.name)),
+            TraceFieldSelector::ResourceAttribute(key) => {
                 // key is a Vec<String> representing a path; we match on the first element
                 let first_key = key.first().map(String::as_str)?;
                 match first_key {
@@ -78,14 +79,14 @@ impl Matchable for SpanWrapper<'_> {
                         .map(|s| Cow::Borrowed(s.as_str())),
                 }
             }
-            LogFieldSelector::LogAttribute(key) => {
+            TraceFieldSelector::SpanAttribute(key) => {
                 let first_key = key.first()?;
                 self.0
                     .meta
                     .get(first_key)
                     .map(|s| Cow::Borrowed(s.as_str()))
             }
-            LogFieldSelector::ScopeAttribute(_) => None,
+            _ => None,
         }
     }
 }
@@ -230,14 +231,14 @@ mod tests {
     }
 
     #[test]
-    fn test_span_body() {
+    fn test_span_name() {
         let span = create_test_span();
         let wrapper = SpanWrapper(&span);
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::Simple(LogField::Body))
+                .get_field(&TraceFieldSelector::Simple(TraceField::Name))
                 .as_deref(),
-            Some("/api/users")
+            Some("test.span")
         );
     }
 
@@ -248,7 +249,7 @@ mod tests {
 
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                .get_field(&TraceFieldSelector::ResourceAttribute(vec![
                     "service".to_string()
                 ]))
                 .as_deref(),
@@ -256,7 +257,7 @@ mod tests {
         );
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                .get_field(&TraceFieldSelector::ResourceAttribute(vec![
                     "name".to_string()
                 ]))
                 .as_deref(),
@@ -264,7 +265,7 @@ mod tests {
         );
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                .get_field(&TraceFieldSelector::ResourceAttribute(vec![
                     "type".to_string()
                 ]))
                 .as_deref(),
@@ -279,7 +280,7 @@ mod tests {
 
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                .get_field(&TraceFieldSelector::ResourceAttribute(vec![
                     "env".to_string()
                 ]))
                 .as_deref(),
@@ -294,7 +295,7 @@ mod tests {
 
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::LogAttribute(vec![
+                .get_field(&TraceFieldSelector::SpanAttribute(vec![
                     "custom_tag".to_string()
                 ]))
                 .as_deref(),
@@ -302,7 +303,7 @@ mod tests {
         );
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::LogAttribute(vec![
+                .get_field(&TraceFieldSelector::SpanAttribute(vec![
                     "nonexistent".to_string()
                 ]))
                 .as_deref(),
@@ -378,7 +379,7 @@ mod tests {
         let wrapper = SpanWrapper(&span);
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                .get_field(&TraceFieldSelector::ResourceAttribute(vec![
                     "resource".to_string()
                 ]))
                 .as_deref(),
@@ -392,7 +393,7 @@ mod tests {
         let wrapper = SpanWrapper(&span);
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ResourceAttribute(vec![
+                .get_field(&TraceFieldSelector::ResourceAttribute(vec![
                     "unknown_field".to_string()
                 ]))
                 .as_deref(),
@@ -406,7 +407,7 @@ mod tests {
         let wrapper = SpanWrapper(&span);
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::ScopeAttribute(vec![
+                .get_field(&TraceFieldSelector::ScopeAttribute(vec![
                     "anything".to_string()
                 ]))
                 .as_deref(),
@@ -420,7 +421,7 @@ mod tests {
         let wrapper = SpanWrapper(&span);
         assert_eq!(
             wrapper
-                .get_field(&LogFieldSelector::Simple(LogField::SeverityText))
+                .get_field(&TraceFieldSelector::Simple(TraceField::TraceState))
                 .as_deref(),
             None
         );

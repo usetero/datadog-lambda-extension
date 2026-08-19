@@ -92,7 +92,7 @@ impl TraceChunkProcessor for ChunkProcessor {
         // Policy-based span filtering
         if let Some(evaluator) = &self.policy_evaluator {
             chunk.spans.retain(|span| {
-                let keep = evaluator.should_keep_sync(&SpanWrapper(span));
+                let keep = evaluator.should_keep(&SpanWrapper(span));
                 if !keep {
                     debug!("TRACE_PROCESSOR | Dropping span due to policy");
                 }

@@ -684,7 +684,7 @@ impl LambdaProcessor {
 
         // Policy evaluation - check if the log should be kept
         if let Some(evaluator) = &self.policy_evaluator
-            && !evaluator.should_keep_sync(&log)
+            && !evaluator.should_keep(&log)
         {
             debug!("LOGS | Dropping log due to policy");
             return;
