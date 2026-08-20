@@ -106,6 +106,19 @@ Replace:
    - **Name:** `AWS_ROLE_ARN`
    - **Value:** Your role ARN
 
+### Step 4: Add a tag-push token
+
+Upstream Release Watch pushes the release tag, and a tag pushed with the default
+`GITHUB_TOKEN` does not trigger another workflow. Without this secret the watch
+tags and nothing publishes.
+
+1. Create a fine-grained PAT (or GitHub App token) with **Contents: write** on
+   this repository
+
+2. Add it as a secret:
+   - **Name:** `RELEASE_TAG_TOKEN`
+   - **Value:** The token
+
 ## Versioning
 
 Releases track DataDog's upstream releases. Upstream publishes `v<N>` tags, so a
@@ -133,16 +146,23 @@ be triggered by hand. It compares DataDog's latest release with two things: the
 version `main` contains (recorded in `.upstream-version`) and whether
 `Tero-Datadog-Extension-<N>` is published.
 
-| State                                     | What the watch does                  |
-| ----------------------------------------- | ------------------------------------ |
-| `main` is behind upstream                 | Opens a PR merging upstream `v<N>`   |
-| `main` is level, `v<N>` not published     | Publishes `v<N>` to all regions      |
-| Both level                                | Nothing                              |
+| State                                 | What the watch does                |
+| ------------------------------------- | ---------------------------------- |
+| `main` is behind upstream             | Opens a PR merging upstream `v<N>` |
+| `main` is level, `v<N>` not published | Pushes tag `v<N>`                  |
+| Both level                            | Nothing                            |
+
+The watch never publishes. It pushes the tag, and the tag triggers **Release
+Lambda Extension** — publishing lives in one place, on one trigger.
 
 A release therefore only happens after a human merged the upstream PR and CI was
 green. When the merge conflicts the watch opens an issue instead of a PR, because
 resolving an upstream merge needs judgement — stale lock entries and API changes
 that only clippy catches.
+
+If the tag already exists but the layer is still unpublished, the watch fails
+loudly rather than re-tagging: a tag can only trigger a release once, so that
+state means a tagged release failed and needs a look.
 
 To check parity without publishing, run it by hand with `release` unticked.
 

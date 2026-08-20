@@ -10,41 +10,13 @@ name: Release Lambda Extension
 #   patch on top of upstream v119 -> Tero-Datadog-Extension-119:2
 #
 # Tag "v119" to release, "v119.2" to release a patch and assert it lands on 2.
+# A tag push is the only automated way in. upstream-release-watch.yml pushes the
+# tag; publishing lives here and nowhere else.
 on:
   push:
     tags:
       - "v[0-9]+"
       - "v[0-9]+.[0-9]+"
-  # Called by upstream-release-watch.yml. A tag pushed with GITHUB_TOKEN does not
-  # trigger another workflow, so the watch job invokes this one directly instead
-  # of relying on a tag push. `dev` defaults to false here, so a watch-driven
-  # release publishes prod layer names however the watch itself was triggered.
-  workflow_call:
-    inputs:
-      version:
-        description: "Upstream version to release, e.g. 119 or 119.2 (patch optional)"
-        required: true
-        type: string
-      regions:
-        description: "Comma-separated AWS regions. Empty publishes to DEFAULT_REGIONS."
-        required: false
-        default: ""
-        type: string
-      architectures:
-        description: "Architectures to build and publish"
-        required: false
-        default: "amd64,arm64"
-        type: string
-      dry_run:
-        description: "Dry run - build but don't publish to AWS"
-        required: false
-        default: false
-        type: boolean
-      dev:
-        description: "Append -dev to the layer name. False publishes a real release."
-        required: false
-        default: false
-        type: boolean
   workflow_dispatch:
     inputs:
       version:
