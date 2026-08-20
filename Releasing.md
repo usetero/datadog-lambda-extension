@@ -190,8 +190,10 @@ publishing to a region the account has not enabled fails the job. Add them to
 
 4. After completion, find the Layer ARNs in the workflow summary
 
-Manual runs append `-dev` to the layer name, so they never overwrite a real
-release.
+Manual runs tick `dev` by default, which appends `-dev` to the layer name so they
+cannot overwrite a real release. Untick it to publish prod names by hand.
+
+Tag pushes and watch-driven releases always publish prod names.
 
 ## Layer Naming Convention
 
