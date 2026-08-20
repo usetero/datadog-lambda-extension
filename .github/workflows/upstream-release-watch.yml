@@ -216,13 +216,53 @@ jobs:
             "git checkout -b chore/upstream-v${UPSTREAM_VERSION} && git merge v${UPSTREAM_VERSION}" \
             '```' )"
 
-  release:
-    name: Release v${{ needs.check.outputs.upstream_version }}
+  # Tagging IS the release: pushing v<N> triggers release-extension.yml, which
+  # owns publishing. There is deliberately no second path from here.
+  #
+  # The push needs RELEASE_TAG_TOKEN (a PAT or GitHub App token with
+  # contents:write). A tag pushed with the default GITHUB_TOKEN does not trigger
+  # another workflow, so with GITHUB_TOKEN the tag would land and nothing would
+  # publish.
+  tag:
+    name: Tag v${{ needs.check.outputs.upstream_version }}
+    runs-on: ubuntu-22.04
     needs: check
     if: |
       needs.check.outputs.needs_release == 'true'
       && (github.event_name == 'schedule' || inputs.release)
-    uses: ./.github/workflows/release-extension.yml
-    with:
-      version: ${{ needs.check.outputs.upstream_version }}
-    secrets: inherit
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Checked out with the PAT so the tag push below is attributed to it
+          # and triggers the release workflow.
+          token: ${{ secrets.RELEASE_TAG_TOKEN }}
+
+      - name: Tag the release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+          UPSTREAM_VERSION: ${{ needs.check.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          TAG="v${UPSTREAM_VERSION}"
+
+          # The tag already existing means a previous release was tagged but did
+          # not publish, so re-tagging cannot retry it. Fail loudly rather than
+          # leave the fork silently behind.
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::$TAG is already tagged but Tero-Datadog-Extension-${UPSTREAM_VERSION} is not published."
+            echo "::error::Re-run Release Lambda Extension for $UPSTREAM_VERSION with dev unticked, then check why the tagged run failed."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes "Tracks [DataDog ${TAG}](https://github.com/DataDog/datadog-lambda-extension/releases/tag/${TAG}). Publishes \`Tero-Datadog-Extension-${UPSTREAM_VERSION}\` and \`Tero-Datadog-Extension-${UPSTREAM_VERSION}-ARM\`."
+
+          echo "::notice::Pushed $TAG. Release Lambda Extension takes over from here."

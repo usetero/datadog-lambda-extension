@@ -10,36 +10,13 @@ name: Release Lambda Extension
 #   patch on top of upstream v119 -> Tero-Datadog-Extension-119:2
 #
 # Tag "v119" to release, "v119.2" to release a patch and assert it lands on 2.
+# A tag push is the only automated way in. upstream-release-watch.yml pushes the
+# tag; publishing lives here and nowhere else.
 on:
   push:
     tags:
       - "v[0-9]+"
       - "v[0-9]+.[0-9]+"
-  # Called by upstream-release-watch.yml. A tag pushed with GITHUB_TOKEN does not
-  # trigger another workflow, so the watch job invokes this one directly instead
-  # of relying on a tag push. github.event_name is the caller's event, so a
-  # scheduled watch run does NOT get the -dev suffix — it is a real release.
-  workflow_call:
-    inputs:
-      version:
-        description: "Upstream version to release, e.g. 119 or 119.2 (patch optional)"
-        required: true
-        type: string
-      regions:
-        description: "Comma-separated AWS regions. Empty publishes to DEFAULT_REGIONS."
-        required: false
-        default: ""
-        type: string
-      architectures:
-        description: "Architectures to build and publish"
-        required: false
-        default: "amd64,arm64"
-        type: string
-      dry_run:
-        description: "Dry run - build but don't publish to AWS"
-        required: false
-        default: false
-        type: boolean
   workflow_dispatch:
     inputs:
       version:
@@ -64,6 +41,13 @@ on:
         description: "Dry run - build but don't publish to AWS"
         required: false
         default: false
+        type: boolean
+      # Defaults true here so a manual run cannot overwrite a real release by
+      # accident. Untick it to publish prod layer names by hand.
+      dev:
+        description: "Append -dev to the layer name"
+        required: false
+        default: true
         type: boolean
 
 permissions:
@@ -262,8 +246,12 @@ jobs:
             COMPATIBLE_ARCH="arm64"
           fi
 
-          # Add -dev suffix for workflow_dispatch (manual) runs
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          # Driven by an explicit input, not github.event_name: inside a called
+          # workflow event_name is the CALLER's event, so keying off it made a
+          # manual run of upstream-release-watch publish -dev names while
+          # reporting a release. Tag pushes leave the input empty, so they are
+          # never -dev.
+          if [ "${{ inputs.dev }}" = "true" ]; then
             DEV_SUFFIX="-dev"
           else
             DEV_SUFFIX=""
