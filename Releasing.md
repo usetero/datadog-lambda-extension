@@ -46,7 +46,7 @@ aws iam create-open-id-connect-provider \
         "lambda:ListLayerVersions",
         "lambda:AddLayerVersionPermission"
       ],
-      "Resource": "arn:aws:lambda:*:YOUR_ACCOUNT_ID:layer:Tero-Datadog-Extension-*"
+      "Resource": "arn:aws:lambda:*:YOUR_ACCOUNT_ID:layer:Tero-Datadog-Extension*"
     },
     {
       "Effect": "Allow",
@@ -142,8 +142,13 @@ A bare `v119` publishes whatever patch comes next. A `v119.2` tag asserts the
 release lands on patch 2 and fails **before** publishing if it would not — a
 layer version cannot be renumbered after the fact.
 
-Tag-based releases publish to the default region (us-east-1) with both
-architectures.
+Tag-based releases publish both architectures to every region in
+`DEFAULT_REGIONS` (see `.github/workflows/release-extension.yml`): all four US
+regions and the five EU regions that AWS enables by default.
+
+Opt-in regions (eu-south-1, eu-south-2, eu-central-2) are excluded, because
+publishing to a region the account has not enabled fails the job. Add them to
+`DEFAULT_REGIONS` once they are enabled.
 
 ### Option 2: Manual release
 
@@ -307,7 +312,8 @@ and the trust policy allows your repository.
 
 ## Multi-Region Deployment
 
-To deploy to multiple regions, specify them comma-separated:
+Releases go to every region in `DEFAULT_REGIONS` by default. To publish to a
+different set, pass them comma-separated to a manual run:
 
 ```
 us-east-1,us-west-2,eu-west-1,ap-southeast-1

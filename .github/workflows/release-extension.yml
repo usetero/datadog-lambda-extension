@@ -22,9 +22,9 @@ on:
         required: true
         type: string
       regions:
-        description: "Comma-separated AWS regions to publish to (e.g., 'us-east-1,us-west-2')"
+        description: "Comma-separated AWS regions. Leave empty to publish to every region in DEFAULT_REGIONS."
         required: false
-        default: "us-east-1"
+        default: ""
         type: string
       architectures:
         description: "Architectures to build and publish"
@@ -44,6 +44,12 @@ on:
 permissions:
   id-token: write
   contents: read
+
+env:
+  # Every US and EU region that is enabled by default. Opt-in regions are left
+  # out on purpose: publishing to one that the account has not enabled fails the
+  # job. Add eu-south-1, eu-south-2 or eu-central-2 here once they are enabled.
+  DEFAULT_REGIONS: "us-east-1,us-east-2,us-west-1,us-west-2,eu-west-1,eu-west-2,eu-west-3,eu-central-1,eu-north-1"
 
 jobs:
   prepare:
@@ -89,7 +95,7 @@ jobs:
         id: vars
         run: |
           # Convert regions to JSON array (compact, single line)
-          REGIONS="${{ inputs.regions || 'us-east-1' }}"
+          REGIONS="${{ inputs.regions || env.DEFAULT_REGIONS }}"
           REGIONS_JSON=$(echo "$REGIONS" | jq -c -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')
           echo "regions_json=$REGIONS_JSON" >> $GITHUB_OUTPUT
           echo "Regions: $REGIONS_JSON"
@@ -98,7 +104,7 @@ jobs:
         id: matrix
         run: |
           ARCHS="${{ inputs.architectures || 'amd64,arm64' }}"
-          REGIONS="${{ inputs.regions || 'us-east-1' }}"
+          REGIONS="${{ inputs.regions || env.DEFAULT_REGIONS }}"
 
           # Build matrix for build job with platform-specific runners
           BUILD_MATRIX='{"include":['
