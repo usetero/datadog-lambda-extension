@@ -1,19 +1,55 @@
 name: Release Lambda Extension
 
+# Versioning tracks DataDog's upstream releases. The upstream version lives in
+# the layer NAME (Tero-Datadog-Extension-119), and the AWS layer version integer
+# is the patch number. An AWS layer version cannot be set, only appended, so
+# putting the upstream number in the name is what keeps it exact — in every
+# region, from the first publish, without burning filler versions.
+#
+#   upstream v119, first release  -> Tero-Datadog-Extension-119:1
+#   patch on top of upstream v119 -> Tero-Datadog-Extension-119:2
+#
+# Tag "v119" to release, "v119.2" to release a patch and assert it lands on 2.
 on:
   push:
     tags:
       - "v[0-9]+"
+      - "v[0-9]+.[0-9]+"
+  # Called by upstream-release-watch.yml. A tag pushed with GITHUB_TOKEN does not
+  # trigger another workflow, so the watch job invokes this one directly instead
+  # of relying on a tag push. github.event_name is the caller's event, so a
+  # scheduled watch run does NOT get the -dev suffix — it is a real release.
+  workflow_call:
+    inputs:
+      version:
+        description: "Upstream version to release, e.g. 119 or 119.2 (patch optional)"
+        required: true
+        type: string
+      regions:
+        description: "Comma-separated AWS regions. Empty publishes to DEFAULT_REGIONS."
+        required: false
+        default: ""
+        type: string
+      architectures:
+        description: "Architectures to build and publish"
+        required: false
+        default: "amd64,arm64"
+        type: string
+      dry_run:
+        description: "Dry run - build but don't publish to AWS"
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       version:
-        description: "Version number (e.g., 100). If not provided, auto-increments from latest."
-        required: false
+        description: "Upstream version to release, e.g. 119 or 119.2 (patch optional)"
+        required: true
         type: string
       regions:
-        description: "Comma-separated AWS regions to publish to (e.g., 'us-east-1,us-west-2')"
+        description: "Comma-separated AWS regions. Leave empty to publish to every region in DEFAULT_REGIONS."
         required: false
-        default: "us-east-1"
+        default: ""
         type: string
       architectures:
         description: "Architectures to build and publish"
@@ -34,37 +70,57 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  # Every US and EU region that is enabled by default. Opt-in regions are left
+  # out on purpose: publishing to one that the account has not enabled fails the
+  # job. Add eu-south-1, eu-south-2 or eu-central-2 here once they are enabled.
+  DEFAULT_REGIONS: "us-east-1,us-east-2,us-west-1,us-west-2,eu-west-1,eu-west-2,eu-west-3,eu-central-1,eu-north-1"
+
 jobs:
   prepare:
     name: Prepare release
     runs-on: ubuntu-22.04
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      upstream_version: ${{ steps.version.outputs.upstream_version }}
+      patch: ${{ steps.version.outputs.patch }}
       regions_json: ${{ steps.vars.outputs.regions_json }}
       build_matrix: ${{ steps.matrix.outputs.build_matrix }}
       publish_matrix: ${{ steps.matrix.outputs.publish_matrix }}
     steps:
       - uses: actions/checkout@v4
 
+      # Accepts "119" or "119.2", with or without a leading "v". The patch is
+      # optional: when absent the publish step takes whatever AWS assigns next,
+      # which is what a first release into a new region needs.
       - name: Determine version
         id: version
+        # Passed through env, not interpolated into the script, so the input
+        # cannot inject shell.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            # Strip 'v' prefix if present and extract number
-            VERSION=$(echo "${{ inputs.version }}" | sed 's/^v//')
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" =~ ^refs/tags/v([0-9]+)$ ]]; then
-            echo "version=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
-          else
-            # Auto-increment will happen at publish time per-region
-            echo "version=auto" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          RAW="$INPUT_VERSION"
+          if [ -z "$RAW" ]; then
+            RAW="${GITHUB_REF#refs/tags/}"
           fi
+
+          if ! PARSED=$(./scripts/parse_release_version.sh "$RAW"); then
+            echo "::error::Could not parse version '$RAW'"
+            exit 1
+          fi
+          read -r UPSTREAM PATCH <<< "$PARSED"
+
+          echo "upstream_version=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          echo "patch=$PATCH" >> "$GITHUB_OUTPUT"
+          echo "Upstream version: $UPSTREAM, patch: ${PATCH:-<next available>}"
 
       - name: Set variables
         id: vars
         run: |
           # Convert regions to JSON array (compact, single line)
-          REGIONS="${{ inputs.regions || 'us-east-1' }}"
+          REGIONS="${{ inputs.regions || env.DEFAULT_REGIONS }}"
           REGIONS_JSON=$(echo "$REGIONS" | jq -c -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')
           echo "regions_json=$REGIONS_JSON" >> $GITHUB_OUTPUT
           echo "Regions: $REGIONS_JSON"
@@ -73,7 +129,7 @@ jobs:
         id: matrix
         run: |
           ARCHS="${{ inputs.architectures || 'amd64,arm64' }}"
-          REGIONS="${{ inputs.regions || 'us-east-1' }}"
+          REGIONS="${{ inputs.regions || env.DEFAULT_REGIONS }}"
 
           # Build matrix for build job with platform-specific runners
           BUILD_MATRIX='{"include":['
@@ -213,8 +269,9 @@ jobs:
             DEV_SUFFIX=""
           fi
 
-          # Layer name: Tero-Datadog-Extension[-ARM][-dev]
-          LAYER_NAME="Tero-Datadog-Extension${ARCH_SUFFIX}${DEV_SUFFIX}"
+          # Layer name: Tero-Datadog-Extension-<upstream>[-ARM][-dev]
+          UPSTREAM="${{ needs.prepare.outputs.upstream_version }}"
+          LAYER_NAME="Tero-Datadog-Extension-${UPSTREAM}${ARCH_SUFFIX}${DEV_SUFFIX}"
 
           echo "layer_name=$LAYER_NAME" >> $GITHUB_OUTPUT
           echo "compatible_arch=$COMPATIBLE_ARCH" >> $GITHUB_OUTPUT
@@ -225,90 +282,71 @@ jobs:
           name: datadog_extension-${{ matrix.arch }}
           path: .layers
 
-      - name: Determine version
+      # A layer version can only be appended, never chosen, so a requested patch
+      # is checked BEFORE publishing. Checking afterwards would leave a wrongly
+      # numbered layer version behind, and those cannot be renumbered.
+      - name: Check target patch version is next
         id: version
         run: |
-          VERSION="${{ needs.prepare.outputs.version }}"
+          set -euo pipefail
           LAYER_NAME="${{ steps.vars.outputs.layer_name }}"
+          PATCH="${{ needs.prepare.outputs.patch }}"
 
-          if [ "$VERSION" = "auto" ]; then
-            # Get latest version and increment
-            LATEST=$(aws lambda list-layer-versions \
-              --layer-name "$LAYER_NAME" \
-              --query 'LayerVersions[0].Version' \
-              --output text 2>/dev/null | head -1 || echo "0")
-            # Handle empty/None result
-            if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
-              LATEST=0
-            fi
-            VERSION=$((LATEST + 1))
-            echo "Auto-incremented version to $VERSION (latest was $LATEST)"
-          fi
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Publish Lambda layer
-        id: publish
-        run: |
-          aws sts get-caller-identity
-          LAYER_NAME="${{ steps.vars.outputs.layer_name }}"
-          VERSION="${{ steps.version.outputs.version }}"
-          LAYER_FILE=".layers/datadog_extension-${{ matrix.arch }}.zip"
-          COMPATIBLE_ARCH="${{ steps.vars.outputs.compatible_arch }}"
-
-          echo "Publishing $LAYER_NAME version $VERSION to ${{ matrix.region }}..."
-
-          # Check if version already exists
           LATEST=$(aws lambda list-layer-versions \
             --layer-name "$LAYER_NAME" \
             --query 'LayerVersions[0].Version' \
             --output text 2>/dev/null | head -1 || echo "0")
-          # Handle empty/None result
           if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
             LATEST=0
           fi
+          NEXT=$((LATEST + 1))
 
-          if [ "$LATEST" -ge "$VERSION" ]; then
-            echo "::warning::Layer $LAYER_NAME version $VERSION already exists (latest: $LATEST), skipping"
-            echo "skipped=true" >> $GITHUB_OUTPUT
-            exit 0
+          if [ -n "$PATCH" ] && [ "$PATCH" != "$NEXT" ]; then
+            echo "::error::$LAYER_NAME in ${{ matrix.region }} would publish patch $NEXT, but $PATCH was requested."
+            echo "::error::Latest published patch is $LATEST. Re-tag as v${{ needs.prepare.outputs.upstream_version }}.$NEXT."
+            exit 1
           fi
 
-          # Publish missing versions up to target
-          while [ "$LATEST" -lt "$VERSION" ]; do
-            PUBLISHED_VERSION=$(aws lambda publish-layer-version \
-              --layer-name "$LAYER_NAME" \
-              --description "Tero Datadog Lambda Extension" \
-              --compatible-architectures "$COMPATIBLE_ARCH" \
-              --zip-file "fileb://${LAYER_FILE}" \
-              --query 'Version' \
-              --output text)
+          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "Publishing $LAYER_NAME patch $NEXT to ${{ matrix.region }}"
 
-            echo "Published version $PUBLISHED_VERSION"
+      - name: Publish Lambda layer
+        id: publish
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity
+          LAYER_NAME="${{ steps.vars.outputs.layer_name }}"
+          LAYER_FILE=".layers/datadog_extension-${{ matrix.arch }}.zip"
+          COMPATIBLE_ARCH="${{ steps.vars.outputs.compatible_arch }}"
+          UPSTREAM="${{ needs.prepare.outputs.upstream_version }}"
 
-            # Make the layer version public
-            aws lambda add-layer-version-permission \
-              --layer-name "$LAYER_NAME" \
-              --version-number "$PUBLISHED_VERSION" \
-              --statement-id public-access \
-              --action lambda:GetLayerVersion \
-              --principal "*"
-            echo "Made version $PUBLISHED_VERSION public"
+          PUBLISHED_VERSION=$(aws lambda publish-layer-version \
+            --layer-name "$LAYER_NAME" \
+            --description "Tero Datadog Lambda Extension (DataDog upstream v${UPSTREAM})" \
+            --compatible-architectures "$COMPATIBLE_ARCH" \
+            --zip-file "fileb://${LAYER_FILE}" \
+            --query 'Version' \
+            --output text)
+          echo "Published version $PUBLISHED_VERSION"
 
-            LATEST=$PUBLISHED_VERSION
-          done
+          # Make the layer version public
+          aws lambda add-layer-version-permission \
+            --layer-name "$LAYER_NAME" \
+            --version-number "$PUBLISHED_VERSION" \
+            --statement-id public-access \
+            --action lambda:GetLayerVersion \
+            --principal "*"
+          echo "Made version $PUBLISHED_VERSION public"
 
-          echo "skipped=false" >> $GITHUB_OUTPUT
-          echo "published_version=$LATEST" >> $GITHUB_OUTPUT
+          echo "published_version=$PUBLISHED_VERSION" >> "$GITHUB_OUTPUT"
 
           # Output the layer ARN for reference
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          LAYER_ARN="arn:aws:lambda:${{ matrix.region }}:${ACCOUNT_ID}:layer:${LAYER_NAME}:${LATEST}"
+          LAYER_ARN="arn:aws:lambda:${{ matrix.region }}:${ACCOUNT_ID}:layer:${LAYER_NAME}:${PUBLISHED_VERSION}"
           echo "Layer ARN: $LAYER_ARN"
-          echo "layer_arn=$LAYER_ARN" >> $GITHUB_OUTPUT
+          echo "layer_arn=$LAYER_ARN" >> "$GITHUB_OUTPUT"
 
       - name: Summary
-        if: steps.publish.outputs.skipped != 'true'
         run: |
           echo "### Published Layer" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
