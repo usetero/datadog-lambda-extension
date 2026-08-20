@@ -1,0 +1,228 @@
+name: Upstream Release Watch
+
+# Keeps the fork level with DataDog's released version.
+#
+# Upstream publishes a v<N> GitHub release. Two things have to be true for us to
+# match it: main must contain upstream v<N>, and Tero-Datadog-Extension-<N> must
+# be published. This job checks both once a day and moves whichever one is
+# behind:
+#
+#   main is behind        -> open a PR merging upstream v<N>
+#   main is level, unreleased -> call release-extension.yml for v<N>
+#   both level            -> nothing to do
+#
+# The version main contains is recorded in .upstream-version. The merge PR bumps
+# it, so releasing only ever happens after a human merged and CI was green.
+on:
+  schedule:
+    # Daily at 13:00 UTC. Upstream cuts a release roughly monthly, so this is
+    # about noticing within a day rather than racing.
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish a release when main is level with upstream but unreleased"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  check:
+    name: Check upstream release
+    runs-on: ubuntu-22.04
+    outputs:
+      upstream_version: ${{ steps.compare.outputs.upstream_version }}
+      merged_version: ${{ steps.compare.outputs.merged_version }}
+      needs_merge: ${{ steps.compare.outputs.needs_merge }}
+      needs_release: ${{ steps.compare.outputs.needs_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Compare upstream release with our state
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          UPSTREAM=$(gh release view \
+            --repo DataDog/datadog-lambda-extension \
+            --json tagName --jq '.tagName' | sed 's/^v//')
+          if [[ ! "$UPSTREAM" =~ ^[0-9]+$ ]]; then
+            echo "::error::Upstream latest release '$UPSTREAM' is not a plain version"
+            exit 1
+          fi
+
+          MERGED=$(tr -d '[:space:]' < .upstream-version)
+          echo "Upstream released: v$UPSTREAM | main contains: v$MERGED"
+
+          NEEDS_MERGE=false
+          NEEDS_RELEASE=false
+
+          if [ "$MERGED" -lt "$UPSTREAM" ]; then
+            NEEDS_MERGE=true
+          else
+            # main is level. Has it shipped? us-east-1 is the reference region.
+            # ponytail: one region, not all nine — a partial multi-region failure
+            # shows up in the release run itself. Check every region here if that
+            # stops being true.
+            VERSIONS=$(aws lambda list-layer-versions \
+              --layer-name "Tero-Datadog-Extension-${UPSTREAM}" \
+              --query 'length(LayerVersions)' \
+              --output text 2>/dev/null || echo "0")
+            if [ -z "$VERSIONS" ] || [ "$VERSIONS" = "None" ]; then
+              VERSIONS=0
+            fi
+            if [ "$VERSIONS" -eq 0 ]; then
+              NEEDS_RELEASE=true
+            fi
+          fi
+
+          {
+            echo "upstream_version=$UPSTREAM"
+            echo "merged_version=$MERGED"
+            echo "needs_merge=$NEEDS_MERGE"
+            echo "needs_release=$NEEDS_RELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Upstream release watch"
+            echo ""
+            echo "| | Version |"
+            echo "|---|---|"
+            echo "| DataDog released | v$UPSTREAM |"
+            echo "| main contains | v$MERGED |"
+            echo ""
+            if [ "$NEEDS_MERGE" = true ]; then
+              echo "main is behind — opening a merge PR."
+            elif [ "$NEEDS_RELEASE" = true ]; then
+              echo "main is level with upstream but v$UPSTREAM is not published."
+            else
+              echo "In parity. Nothing to do."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  merge:
+    name: Open upstream merge PR
+    runs-on: ubuntu-22.04
+    needs: check
+    if: needs.check.outputs.needs_merge == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream release
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_VERSION: ${{ needs.check.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="chore/upstream-v${UPSTREAM_VERSION}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch $BRANCH already exists; a merge is already in flight."
+            exit 0
+          fi
+
+          git remote add upstream https://github.com/DataDog/datadog-lambda-extension.git
+          git fetch --tags upstream "v${UPSTREAM_VERSION}"
+          git checkout -b "$BRANCH"
+
+          if ! git merge --no-edit "v${UPSTREAM_VERSION}"; then
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            git merge --abort
+            echo "conflicts<<EOF" >> "$GITHUB_OUTPUT"
+            echo "$CONFLICTS" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "conflicted=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "$UPSTREAM_VERSION" > .upstream-version
+          git commit -am "chore: record upstream v${UPSTREAM_VERSION}" --allow-empty
+          git push origin "$BRANCH"
+          echo "conflicted=false" >> "$GITHUB_OUTPUT"
+
+      - name: Open pull request
+        if: steps.merge.outputs.conflicted == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_VERSION: ${{ needs.check.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --base main \
+            --head "chore/upstream-v${UPSTREAM_VERSION}" \
+            --title "chore: merge upstream v${UPSTREAM_VERSION}" \
+            --body "$(printf '%s\n' \
+              "## Overview" \
+              "" \
+              "Merges DataDog upstream \`v${UPSTREAM_VERSION}\` and records it in \`.upstream-version\`." \
+              "Opened automatically by Upstream Release Watch." \
+              "" \
+              "## Testing" \
+              "" \
+              "CI must be green before merge. Once this lands, the daily watch publishes" \
+              "\`Tero-Datadog-Extension-${UPSTREAM_VERSION}\` to every default region." )"
+
+      # A conflicted merge needs judgement — stale lock entries and API breakage
+      # that only clippy catches. Report it and let a human drive.
+      - name: Report conflicts
+        if: steps.merge.outputs.conflicted == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_VERSION: ${{ needs.check.outputs.upstream_version }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          set -euo pipefail
+          TITLE="Upstream v${UPSTREAM_VERSION} merge has conflicts"
+          if gh issue list --state open --search "$TITLE in:title" --json title \
+              --jq '.[].title' | grep -qxF "$TITLE"; then
+            echo "Issue already open."
+            exit 0
+          fi
+          gh issue create --title "$TITLE" --body "$(printf '%s\n' \
+            "Merging upstream \`v${UPSTREAM_VERSION}\` into main conflicts, so no PR was opened." \
+            "" \
+            "Conflicted files:" \
+            "" \
+            '```' \
+            "$CONFLICTS" \
+            '```' \
+            "" \
+            "Resolve locally, then set \`.upstream-version\` to ${UPSTREAM_VERSION}:" \
+            "" \
+            '```bash' \
+            "git remote add upstream https://github.com/DataDog/datadog-lambda-extension.git" \
+            "git fetch --tags upstream v${UPSTREAM_VERSION}" \
+            "git checkout -b chore/upstream-v${UPSTREAM_VERSION} && git merge v${UPSTREAM_VERSION}" \
+            '```' )"
+
+  release:
+    name: Release v${{ needs.check.outputs.upstream_version }}
+    needs: check
+    if: |
+      needs.check.outputs.needs_release == 'true'
+      && (github.event_name == 'schedule' || inputs.release)
+    uses: ./.github/workflows/release-extension.yml
+    with:
+      version: ${{ needs.check.outputs.upstream_version }}
+    secrets: inherit

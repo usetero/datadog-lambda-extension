@@ -126,6 +126,29 @@ versions to advance a counter, and it gives patches somewhere to live. A new
 region starts at patch 1 for whatever upstream versions you publish there, so
 patch numbers can differ per region; the upstream number never does.
 
+## Staying level with upstream
+
+`.github/workflows/upstream-release-watch.yml` runs daily at 13:00 UTC and can
+be triggered by hand. It compares DataDog's latest release with two things: the
+version `main` contains (recorded in `.upstream-version`) and whether
+`Tero-Datadog-Extension-<N>` is published.
+
+| State                                     | What the watch does                  |
+| ----------------------------------------- | ------------------------------------ |
+| `main` is behind upstream                 | Opens a PR merging upstream `v<N>`   |
+| `main` is level, `v<N>` not published     | Publishes `v<N>` to all regions      |
+| Both level                                | Nothing                              |
+
+A release therefore only happens after a human merged the upstream PR and CI was
+green. When the merge conflicts the watch opens an issue instead of a PR, because
+resolving an upstream merge needs judgement — stale lock entries and API changes
+that only clippy catches.
+
+To check parity without publishing, run it by hand with `release` unticked.
+
+`.upstream-version` is the record of what `main` contains. The merge PR bumps it;
+set it by hand if you merge upstream without the watch.
+
 ## Releasing via GitHub Actions
 
 ### Option 1: Tag-based release (recommended)
