@@ -9,6 +9,7 @@ use policy_rs::config::{
 };
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use std::collections::HashMap;
 use tracing::error;
 
 /// Configuration for a policy provider.
@@ -48,6 +49,8 @@ impl PolicyProviderConfig {
                 PolicyRsProviderConfig::File(FileProviderConfig {
                     id: id.clone(),
                     path: path.clone(),
+                    // Filesystem events are reliable here; no extra polling.
+                    poll_interval_secs: None,
                 })
             }
             PolicyProviderConfig::Http {
@@ -67,6 +70,8 @@ impl PolicyProviderConfig {
                     .collect(),
                 poll_interval_secs: Some(*poll_interval_secs),
                 content_type: Some("json".to_string()),
+                resource_attributes: HashMap::new(),
+                labels: HashMap::new(),
             }),
         }
     }

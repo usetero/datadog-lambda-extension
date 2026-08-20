@@ -314,6 +314,8 @@ async fn extension_loop_active(
             value: Some(AnyValue {
                 value: Some(any_value::Value::StringValue(value.to_string())),
             }),
+            // Profiling-only OTLP field; irrelevant here.
+            ..Default::default()
         }
     }
 
