@@ -6,7 +6,7 @@
 # layer name (Tero-Datadog-Extension-119) and the AWS layer version integer is
 # the patch. See .github/workflows/release-extension.yml.
 #
-#   119    -> upstream 119, patch "" (take the next version AWS assigns)
+#   119    -> upstream 119, patch "" (the release workflow targets patch 1)
 #   119.2  -> upstream 119, patch 2  (assert it lands on 2 before publishing)
 #
 # A leading "v" is optional, so a tag ref can be passed straight through.

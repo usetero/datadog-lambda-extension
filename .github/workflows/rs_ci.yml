@@ -23,6 +23,13 @@ jobs:
           access_token: ${{ secrets.GITHUB_TOKEN }}
           all_but_latest: true # can cancel workflows scheduled later
 
+  release-contract:
+    name: Release Contract
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: ./scripts/verify_serverless_layer.sh
+
   check:
     name: Check
     runs-on: ubuntu-22.04

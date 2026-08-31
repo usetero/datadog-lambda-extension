@@ -4,16 +4,21 @@ name: Upstream Release Watch
 #
 # Upstream publishes a v<N> GitHub release. Two things have to be true for us to
 # match it: main must contain upstream v<N>, and Tero-Datadog-Extension-<N> must
-# be published. This job checks both once a day and moves whichever one is
-# behind:
+# be published. This job checks both daily and whenever an upstream-version
+# update lands on main, then moves whichever one is behind:
 #
 #   main is behind        -> open a PR merging upstream v<N>
-#   main is level, unreleased -> call release-extension.yml for v<N>
-#   both level            -> nothing to do
+#   main is level, unreleased -> tag v<N>, which publishes and verifies the matrix
+#   source and full matrix level -> nothing to do
 #
 # The version main contains is recorded in .upstream-version. The merge PR bumps
 # it, so releasing only ever happens after a human merged and CI was green.
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - .upstream-version
   schedule:
     # Daily at 13:00 UTC. Upstream cuts a release roughly monthly, so this is
     # about noticing within a day rather than racing.
@@ -76,18 +81,9 @@ jobs:
           if [ "$MERGED" -lt "$UPSTREAM" ]; then
             NEEDS_MERGE=true
           else
-            # main is level. Has it shipped? us-east-1 is the reference region.
-            # ponytail: one region, not all nine — a partial multi-region failure
-            # shows up in the release run itself. Check every region here if that
-            # stops being true.
-            VERSIONS=$(aws lambda list-layer-versions \
-              --layer-name "Tero-Datadog-Extension-${UPSTREAM}" \
-              --query 'length(LayerVersions)' \
-              --output text 2>/dev/null || echo "0")
-            if [ -z "$VERSIONS" ] || [ "$VERSIONS" = "None" ]; then
-              VERSIONS=0
-            fi
-            if [ "$VERSIONS" -eq 0 ]; then
+            # A release is complete only when both architectures exist with a
+            # public policy in every supported region.
+            if ! ./scripts/verify_release_matrix.sh "$UPSTREAM" 1; then
               NEEDS_RELEASE=true
             fi
           fi
@@ -112,7 +108,7 @@ jobs:
             elif [ "$NEEDS_RELEASE" = true ]; then
               echo "main is level with upstream but v$UPSTREAM is not published."
             else
-              echo "In parity. Nothing to do."
+              echo "Source and the complete production matrix are in parity. Nothing to do."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -180,8 +176,9 @@ jobs:
               "" \
               "## Testing" \
               "" \
-              "CI must be green before merge. Once this lands, the daily watch publishes" \
-              "\`Tero-Datadog-Extension-${UPSTREAM_VERSION}\` to every default region." )"
+              "CI must be green before merge. Once this lands, the watch publishes" \
+              "and verifies \`Tero-Datadog-Extension-${UPSTREAM_VERSION}\` in every supported" \
+              "region, then opens a separate consumer-template promotion PR." )"
 
       # A conflicted merge needs judgement — stale lock entries and API breakage
       # that only clippy catches. Report it and let a human drive.
@@ -229,7 +226,7 @@ jobs:
     needs: check
     if: |
       needs.check.outputs.needs_release == 'true'
-      && (github.event_name == 'schedule' || inputs.release)
+      && (github.event_name == 'schedule' || github.event_name == 'push' || inputs.release)
     permissions:
       contents: write
     steps:
