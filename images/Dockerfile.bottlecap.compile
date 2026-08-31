@@ -32,8 +32,12 @@ ENV PATH="${PATH}:/root/.cargo/bin"
 
 # Download Boost headers for vectorscan (AL2's boost is too old or cmake can't find it)
 ARG BOOST_VERSION=1.83.0
+ARG BOOST_SHA256=c0685b68dd44cc46574cce86c4e17c0f611b15e195be9848dfd0769a0a207628
 RUN BOOST_VERSION_UNDERSCORE=$(echo ${BOOST_VERSION} | tr '.' '_') && \
-    curl -L -o /tmp/boost.tar.gz "https://sourceforge.net/projects/boost/files/boost/${BOOST_VERSION}/boost_${BOOST_VERSION_UNDERSCORE}.tar.gz/download" && \
+    curl --fail --location --retry 5 --retry-all-errors \
+        --output /tmp/boost.tar.gz \
+        "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_VERSION_UNDERSCORE}.tar.gz" && \
+    echo "${BOOST_SHA256}  /tmp/boost.tar.gz" | sha256sum --check --strict && \
     cd /tmp && tar -xzf boost.tar.gz && \
     mkdir -p /usr/local/include && \
     cp -r /tmp/boost_${BOOST_VERSION_UNDERSCORE}/boost /usr/local/include/ && \

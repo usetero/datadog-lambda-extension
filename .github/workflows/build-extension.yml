@@ -18,34 +18,34 @@ env:
   PB_VERSION: 25.3
   PB_URL: https://github.com/protocolbuffers/protobuf/releases/download
 
+concurrency:
+  group: build-extension-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build ${{ matrix.arch }}
-    runs-on: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+            platform: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: aarch64
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
       - name: Set build variables
         id: vars
         run: |
-          if [ "${{ matrix.arch }}" == "amd64" ]; then
-            echo "platform=x86_64" >> $GITHUB_OUTPUT
-          else
-            echo "platform=aarch64" >> $GITHUB_OUTPUT
-          fi
-
           echo "suffix=${{ matrix.arch }}" >> $GITHUB_OUTPUT
 
           if [ "${{ inputs.debug }}" == "true" ]; then
@@ -56,12 +56,12 @@ jobs:
 
       - name: Build Bottlecap binary
         run: |
-          docker buildx build --platform linux/${{ matrix.arch }} \
+          docker buildx build \
             --progress plain \
             --no-cache \
             -t datadog/compile-bottlecap \
             -f ./images/Dockerfile.bottlecap.compile \
-            --build-arg PLATFORM=${{ steps.vars.outputs.platform }} \
+            --build-arg PLATFORM=${{ matrix.platform }} \
             --build-arg FIPS=0 \
             --build-arg DEBUG=${{ steps.vars.outputs.debug }} \
             --output type=local,dest=.binaries/compiled-bottlecap-${{ steps.vars.outputs.suffix }} \
