@@ -4,8 +4,8 @@ name: Upstream Release Watch
 #
 # Upstream publishes a v<N> GitHub release. Two things have to be true for us to
 # match it: main must contain upstream v<N>, and Tero-Datadog-Extension-<N> must
-# be published. This job checks both once a day and moves whichever one is
-# behind:
+# be published. This job checks both daily and whenever an upstream-version
+# update lands on main, then moves whichever one is behind:
 #
 #   main is behind        -> open a PR merging upstream v<N>
 #   main is level, unreleased -> call release-extension.yml for v<N>
@@ -14,6 +14,11 @@ name: Upstream Release Watch
 # The version main contains is recorded in .upstream-version. The merge PR bumps
 # it, so releasing only ever happens after a human merged and CI was green.
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - .upstream-version
   schedule:
     # Daily at 13:00 UTC. Upstream cuts a release roughly monthly, so this is
     # about noticing within a day rather than racing.
@@ -157,6 +162,7 @@ jobs:
           fi
 
           echo "$UPSTREAM_VERSION" > .upstream-version
+          ./scripts/set_serverless_layer_version.sh "$UPSTREAM_VERSION" 1
           git commit -am "chore: record upstream v${UPSTREAM_VERSION}" --allow-empty
           git push origin "$BRANCH"
           echo "conflicted=false" >> "$GITHUB_OUTPUT"
@@ -175,12 +181,13 @@ jobs:
             --body "$(printf '%s\n' \
               "## Overview" \
               "" \
-              "Merges DataDog upstream \`v${UPSTREAM_VERSION}\` and records it in \`.upstream-version\`." \
+              "Merges DataDog upstream \`v${UPSTREAM_VERSION}\`, records it in \`.upstream-version\`," \
+              "and advances \`serverless.yaml\` to the new layer name at patch 1." \
               "Opened automatically by Upstream Release Watch." \
               "" \
               "## Testing" \
               "" \
-              "CI must be green before merge. Once this lands, the daily watch publishes" \
+              "CI must be green before merge. Once this lands, the watch publishes" \
               "\`Tero-Datadog-Extension-${UPSTREAM_VERSION}\` to every default region." )"
 
       # A conflicted merge needs judgement — stale lock entries and API breakage
@@ -229,7 +236,7 @@ jobs:
     needs: check
     if: |
       needs.check.outputs.needs_release == 'true'
-      && (github.event_name == 'schedule' || inputs.release)
+      && (github.event_name == 'schedule' || github.event_name == 'push' || inputs.release)
     permissions:
       contents: write
     steps:

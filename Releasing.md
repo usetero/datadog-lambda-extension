@@ -44,7 +44,9 @@ aws iam create-open-id-connect-provider \
       "Action": [
         "lambda:PublishLayerVersion",
         "lambda:ListLayerVersions",
-        "lambda:AddLayerVersionPermission"
+        "lambda:AddLayerVersionPermission",
+        "lambda:GetLayerVersion",
+        "lambda:GetLayerVersionPolicy"
       ],
       "Resource": "arn:aws:lambda:*:YOUR_ACCOUNT_ID:layer:Tero-Datadog-Extension*"
     },
@@ -181,9 +183,18 @@ git tag v119.2      # patch on top of upstream v119
 git push origin v119.2
 ```
 
-A bare `v119` publishes whatever patch comes next. A `v119.2` tag asserts the
-release lands on patch 2 and fails **before** publishing if it would not — a
-layer version cannot be renumbered after the fact.
+A bare `v119` publishes patch 1. Later patches use an explicit tag such as
+`v119.2`. Every release fails **before** publishing if that patch would not be
+next, because a layer version cannot be renumbered after the fact and the
+consumer template must resolve to the same version in every region.
+
+Before a production tag is pushed, update `TeroExtensionLayerUpstream` and
+`TeroExtensionLayerVersion` in `serverless.yaml`. The updater verifies the
+contract after editing:
+
+```bash
+./scripts/set_serverless_layer_version.sh 119 1
+```
 
 Tag-based releases publish both architectures to every region in
 `DEFAULT_REGIONS` (see `.github/workflows/release-extension.yml`): all four US
@@ -322,6 +333,22 @@ aws lambda publish-layer-version \
   --region $AWS_REGION
 ```
 
+Publishing creates a private layer version. Make each returned version public
+before distributing its ARN:
+
+```bash
+aws lambda add-layer-version-permission \
+  --layer-name "Tero-Datadog-Extension-119-ARM" \
+  --version-number 1 \
+  --statement-id public-access \
+  --action lambda:GetLayerVersion \
+  --principal "*" \
+  --region $AWS_REGION
+
+./scripts/verify_published_layer.sh \
+  "$AWS_REGION" "Tero-Datadog-Extension-119-ARM" 1 arm64
+```
+
 ## Troubleshooting
 
 ### Build fails with Boost download error
@@ -348,6 +375,18 @@ The upstream number in the layer name is unaffected.
 
 Verify your IAM role has the required `lambda:PublishLayerVersion` permission
 and the trust policy allows your repository.
+
+### A customer cannot fetch a layer
+
+First confirm the ARN uses the release number in the layer name and the patch as
+the final ARN component. For example, upstream v119 patch 1 on ARM64 is
+`Tero-Datadog-Extension-119-ARM:1`, not
+`Tero-Datadog-Extension-ARM:119`.
+
+From the customer account, call `get-layer-version` with the layer ARN without
+its final version component. If it fails, verify the customer role allows
+`lambda:GetLayerVersion` and is not restricted by an SCP, permissions boundary,
+session policy, or VPC endpoint policy.
 
 ### OIDC authentication fails
 

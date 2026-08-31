@@ -73,9 +73,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Accepts "119" or "119.2", with or without a leading "v". The patch is
-      # optional: when absent the publish step takes whatever AWS assigns next,
-      # which is what a first release into a new region needs.
+      # Accepts "119" or "119.2", with or without a leading "v". A missing
+      # patch means patch 1; later patches must be explicit so every region and
+      # the consumer template resolve to the same immutable layer version.
       - name: Determine version
         id: version
         # Passed through env, not interpolated into the script, so the input
@@ -98,7 +98,7 @@ jobs:
 
           echo "upstream_version=$UPSTREAM" >> "$GITHUB_OUTPUT"
           echo "patch=$PATCH" >> "$GITHUB_OUTPUT"
-          echo "Upstream version: $UPSTREAM, patch: ${PATCH:-<next available>}"
+          echo "Upstream version: $UPSTREAM, patch: ${PATCH:-1}"
 
       - name: Set variables
         id: vars
@@ -108,6 +108,17 @@ jobs:
           REGIONS_JSON=$(echo "$REGIONS" | jq -c -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')
           echo "regions_json=$REGIONS_JSON" >> $GITHUB_OUTPUT
           echo "Regions: $REGIONS_JSON"
+
+      # Production releases are also a consumer-template contract. The layer
+      # name and patch embedded in serverless.yaml must describe what this run
+      # will publish, otherwise customers receive an ARN that cannot resolve.
+      - name: Verify consumer template layer
+        if: ${{ github.event_name == 'push' || inputs.dev != true }}
+        run: |
+          PATCH="${{ steps.version.outputs.patch }}"
+          ./scripts/verify_serverless_layer.sh \
+            "${{ steps.version.outputs.upstream_version }}" \
+            "${PATCH:-1}"
 
       - name: Build matrices
         id: matrix
@@ -270,9 +281,10 @@ jobs:
           name: datadog_extension-${{ matrix.arch }}
           path: .layers
 
-      # A layer version can only be appended, never chosen, so a requested patch
-      # is checked BEFORE publishing. Checking afterwards would leave a wrongly
-      # numbered layer version behind, and those cannot be renumbered.
+      # A layer version can only be appended, never chosen, so the target patch
+      # is checked BEFORE publishing. A bare v<N> release must be patch 1; later
+      # patches use an explicit v<N>.<PATCH> tag. This keeps every region and the
+      # consumer template on the same immutable layer version.
       - name: Check target patch version is next
         id: version
         run: |
@@ -288,10 +300,11 @@ jobs:
             LATEST=0
           fi
           NEXT=$((LATEST + 1))
+          TARGET=${PATCH:-1}
 
-          if [ -n "$PATCH" ] && [ "$PATCH" != "$NEXT" ]; then
-            echo "::error::$LAYER_NAME in ${{ matrix.region }} would publish patch $NEXT, but $PATCH was requested."
-            echo "::error::Latest published patch is $LATEST. Re-tag as v${{ needs.prepare.outputs.upstream_version }}.$NEXT."
+          if [ "$TARGET" != "$NEXT" ]; then
+            echo "::error::$LAYER_NAME in ${{ matrix.region }} would publish patch $NEXT, but $TARGET is required."
+            echo "::error::Latest published patch is $LATEST. Use an explicit v${{ needs.prepare.outputs.upstream_version }}.$NEXT patch release and update serverless.yaml first."
             exit 1
           fi
 
@@ -308,31 +321,67 @@ jobs:
           COMPATIBLE_ARCH="${{ steps.vars.outputs.compatible_arch }}"
           UPSTREAM="${{ needs.prepare.outputs.upstream_version }}"
 
-          PUBLISHED_VERSION=$(aws lambda publish-layer-version \
+          PUBLISH_RESULT=$(aws lambda publish-layer-version \
             --layer-name "$LAYER_NAME" \
             --description "Tero Datadog Lambda Extension (DataDog upstream v${UPSTREAM})" \
             --compatible-architectures "$COMPATIBLE_ARCH" \
             --zip-file "fileb://${LAYER_FILE}" \
-            --query 'Version' \
-            --output text)
+            --output json)
+          PUBLISHED_VERSION=$(jq -r '.Version' <<< "$PUBLISH_RESULT")
+          LAYER_VERSION_ARN=$(jq -r '.LayerVersionArn' <<< "$PUBLISH_RESULT")
+
+          if ! jq -e \
+              --arg architecture "$COMPATIBLE_ARCH" \
+              --argjson version "$PUBLISHED_VERSION" \
+              '.Version == $version and (.CompatibleArchitectures | index($architecture) != null)' \
+              <<< "$PUBLISH_RESULT" >/dev/null; then
+            echo "::error::AWS publish response did not match the requested version and architecture."
+            exit 1
+          fi
           echo "Published version $PUBLISHED_VERSION"
 
           # Make the layer version public
-          aws lambda add-layer-version-permission \
+          PERMISSION_RESULT=$(aws lambda add-layer-version-permission \
             --layer-name "$LAYER_NAME" \
             --version-number "$PUBLISHED_VERSION" \
             --statement-id public-access \
             --action lambda:GetLayerVersion \
-            --principal "*"
+            --principal "*" \
+            --output json)
+          PERMISSION_STATEMENT=$(jq -r '.Statement' <<< "$PERMISSION_RESULT")
+          if ! jq -e --arg resource "$LAYER_VERSION_ARN" '
+              .Effect == "Allow"
+              and .Principal == "*"
+              and .Action == "lambda:GetLayerVersion"
+              and .Resource == $resource
+            ' <<< "$PERMISSION_STATEMENT" >/dev/null; then
+            echo "::error::AWS did not return the expected public layer permission."
+            exit 1
+          fi
           echo "Made version $PUBLISHED_VERSION public"
+
+          LIST_RESULT=$(aws lambda list-layer-versions \
+            --layer-name "$LAYER_NAME" \
+            --output json)
+          if ! jq -e \
+              --arg arn "$LAYER_VERSION_ARN" \
+              --arg architecture "$COMPATIBLE_ARCH" \
+              --argjson version "$PUBLISHED_VERSION" \
+              'any(.LayerVersions[];
+                .LayerVersionArn == $arn
+                and .Version == $version
+                and (.CompatibleArchitectures | index($architecture) != null))' \
+              <<< "$LIST_RESULT" >/dev/null; then
+            echo "::error::Published layer version was not returned by ListLayerVersions."
+            exit 1
+          fi
+          echo "Verified published version and architecture"
 
           echo "published_version=$PUBLISHED_VERSION" >> "$GITHUB_OUTPUT"
 
           # Output the layer ARN for reference
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          LAYER_ARN="arn:aws:lambda:${{ matrix.region }}:${ACCOUNT_ID}:layer:${LAYER_NAME}:${PUBLISHED_VERSION}"
-          echo "Layer ARN: $LAYER_ARN"
-          echo "layer_arn=$LAYER_ARN" >> "$GITHUB_OUTPUT"
+          echo "Layer ARN: $LAYER_VERSION_ARN"
+          echo "layer_arn=$LAYER_VERSION_ARN" >> "$GITHUB_OUTPUT"
 
       - name: Summary
         run: |

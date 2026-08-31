@@ -36,8 +36,10 @@ Mappings:
       Bypass: false
     TeroExtensionLayerAwsAccount:
       Number: 242046726909
+    TeroExtensionLayerUpstream:
+      Version: 99
     TeroExtensionLayerVersion:
-      Version: 3
+      Version: 1
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -130,7 +132,7 @@ Parameters:
       - "false"
     Default: "false"
     Description: >-
-      Use the dev version of the Tero extension layer (Tero-Datadog-Extension-ARM-dev).
+      Use the dev version of the Tero extension layer.
 
 Resources:
   CloudFormationLifeCycle:
@@ -161,15 +163,19 @@ Resources:
         - !If
           - UseTeroDevLayer
           - !Sub
-            - "arn:aws:lambda:${AWS::Region}:${AccountNumber}:layer:Tero-Datadog-Extension-ARM-dev:${LayerVersion}"
+            - "arn:aws:lambda:${AWS::Region}:${AccountNumber}:layer:Tero-Datadog-Extension-${UpstreamVersion}-ARM-dev:${LayerVersion}"
             - AccountNumber:
                 !FindInMap [Constants, TeroExtensionLayerAwsAccount, Number]
+              UpstreamVersion:
+                !FindInMap [Constants, TeroExtensionLayerUpstream, Version]
               LayerVersion:
                 !FindInMap [Constants, TeroExtensionLayerVersion, Version]
           - !Sub
-            - "arn:aws:lambda:${AWS::Region}:${AccountNumber}:layer:Tero-Datadog-Extension-ARM:${LayerVersion}"
+            - "arn:aws:lambda:${AWS::Region}:${AccountNumber}:layer:Tero-Datadog-Extension-${UpstreamVersion}-ARM:${LayerVersion}"
             - AccountNumber:
                 !FindInMap [Constants, TeroExtensionLayerAwsAccount, Number]
+              UpstreamVersion:
+                !FindInMap [Constants, TeroExtensionLayerUpstream, Version]
               LayerVersion:
                 !FindInMap [Constants, TeroExtensionLayerVersion, Version]
         - !Join
