@@ -199,9 +199,14 @@ jobs:
           cp ./scripts/datadog_wrapper .layers/datadog_extension-${{ matrix.arch }}/datadog_wrapper
           chmod +x .layers/datadog_extension-${{ matrix.arch }}/datadog_wrapper
 
+          # Normalize archive metadata so rebuilding the same source produces
+          # the same AWS CodeSha256 and a later retry can verify completed cells.
+          find .layers/datadog_extension-${{ matrix.arch }} \
+            -exec touch -t 198001010000 {} +
+
           # Create zip
           cd .layers/datadog_extension-${{ matrix.arch }}
-          zip -r ../datadog_extension-${{ matrix.arch }}.zip extensions datadog_wrapper
+          TZ=UTC zip -X -r ../datadog_extension-${{ matrix.arch }}.zip extensions datadog_wrapper
           cd ../..
 
           # Show size
