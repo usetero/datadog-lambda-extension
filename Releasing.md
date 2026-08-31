@@ -136,31 +136,34 @@ and the layer **version** integer is the patch number:
 | v119.2  | `Tero-Datadog-Extension-119`    | 2             |
 | v120    | `Tero-Datadog-Extension-120`    | 1             |
 
-This keeps the upstream number exact in every region without publishing filler
-versions to advance a counter, and it gives patches somewhere to live. A new
-region starts at patch 1 for whatever upstream versions you publish there, so
-patch numbers can differ per region; the upstream number never does.
+This keeps the upstream number exact without publishing filler versions to
+advance a counter, and it gives patches somewhere to live. A production release
+is complete only when the same immutable patch is public for both architectures
+in every supported region.
 
 ## Staying level with upstream
 
 `.github/workflows/upstream-release-watch.yml` runs daily at 13:00 UTC and can
-be triggered by hand. It compares DataDog's latest release with two things: the
-version `main` contains (recorded in `.upstream-version`) and whether
-`Tero-Datadog-Extension-<N>` is published.
+be triggered by hand. It compares DataDog's latest release with the version
+`main` contains (recorded in `.upstream-version`) and verifies both production
+architectures and their public policies in every region listed in
+`.lambda-layer-regions`.
 
 | State                                 | What the watch does                |
 | ------------------------------------- | ---------------------------------- |
 | `main` is behind upstream             | Opens a PR merging upstream `v<N>` |
-| `main` is level, `v<N>` not published | Pushes tag `v<N>`                  |
+| `main` is level, release incomplete   | Pushes tag `v<N>` or reports the failed tag |
 | Both level                            | Nothing                            |
 
 The watch never publishes. It pushes the tag, and the tag triggers **Release
-Lambda Extension** — publishing lives in one place, on one trigger.
+Lambda Extension**. Publishing lives in one workflow. After every target is
+verified, that workflow opens a separate PR to advance `serverless.yaml`, so the
+consumer template never points at an incomplete release.
 
 A release therefore only happens after a human merged the upstream PR and CI was
-green. When the merge conflicts the watch opens an issue instead of a PR, because
-resolving an upstream merge needs judgement — stale lock entries and API changes
-that only clippy catches.
+green. The upstream PR updates `.upstream-version`, but does not advance the
+consumer template. When the merge conflicts the watch opens an issue instead of
+a PR, because resolving an upstream merge needs judgement.
 
 If the tag already exists but the layer is still unpublished, the watch fails
 loudly rather than re-tagging: a tag can only trigger a release once, so that
@@ -188,21 +191,20 @@ A bare `v119` publishes patch 1. Later patches use an explicit tag such as
 next, because a layer version cannot be renumbered after the fact and the
 consumer template must resolve to the same version in every region.
 
-Before a production tag is pushed, update `TeroExtensionLayerUpstream` and
-`TeroExtensionLayerVersion` in `serverless.yaml`. The updater verifies the
-contract after editing:
+Do not update `serverless.yaml` before publishing. A successful production
+release verifies the entire AWS matrix and opens a promotion PR using:
 
 ```bash
 ./scripts/set_serverless_layer_version.sh 119 1
 ```
 
 Tag-based releases publish both architectures to every region in
-`DEFAULT_REGIONS` (see `.github/workflows/release-extension.yml`): all four US
-regions and the five EU regions that AWS enables by default.
+`.lambda-layer-regions`: all four US regions and the five EU regions that AWS
+enables by default.
 
 Opt-in regions (eu-south-1, eu-south-2, eu-central-2) are excluded, because
 publishing to a region the account has not enabled fails the job. Add them to
-`DEFAULT_REGIONS` once they are enabled.
+`.lambda-layer-regions` once they are enabled.
 
 ### Option 2: Manual release
 
@@ -222,7 +224,9 @@ publishing to a region the account has not enabled fails the job. Add them to
 4. After completion, find the Layer ARNs in the workflow summary
 
 Manual runs tick `dev` by default, which appends `-dev` to the layer name so they
-cannot overwrite a real release. Untick it to publish prod names by hand.
+cannot overwrite a real release. Untick it to publish prod names by hand. A
+production manual run opens a template promotion PR only after the complete
+default-region matrix exists and passes verification.
 
 Tag pushes and watch-driven releases always publish prod names.
 
@@ -363,13 +367,13 @@ compatibility fix.
 
 ### Release fails with "would publish patch N, but M was requested"
 
-A `v119.2` tag asserts the release lands on patch 2. The check runs before
-publishing, because a layer version cannot be renumbered once it exists. The
-error reports the patch that would actually be published — re-tag with that
-number, or drop the patch (`v119`) to accept whatever comes next.
+A `v119.2` tag asserts the release lands on patch 2. Each matrix cell follows an
+idempotent rule: verify and reuse patch 2 if it already exists, publish it if it
+is next, and fail otherwise. A rerun therefore repairs only missing cells and
+verifies completed ones without creating patch 3.
 
-Patch numbers are per region, so a region added later sits behind the others.
-The upstream number in the layer name is unaffected.
+Every production region must reach the same patch. When adding a region after a
+patch release, publish the missing earlier patches before promoting that region.
 
 ### Permission denied when publishing
 
@@ -396,7 +400,7 @@ session policy, or VPC endpoint policy.
 
 ## Multi-Region Deployment
 
-Releases go to every region in `DEFAULT_REGIONS` by default. To publish to a
+Releases go to every region in `.lambda-layer-regions` by default. To publish to a
 different set, pass them comma-separated to a manual run:
 
 ```
@@ -406,5 +410,6 @@ us-east-1,us-west-2,eu-west-1,ap-southeast-1
 Each region will get its own copy of the layer. Lambda functions must use a
 layer from the same region they're deployed in.
 
-Adding a region needs no catch-up work: the upstream version lives in the layer
-name, so a new region publishes `Tero-Datadog-Extension-119:1` directly.
+For a new upstream version, a newly supported region starts directly at
+`Tero-Datadog-Extension-119:1`. If patch 2 or later already exists elsewhere,
+bring the new region through the earlier immutable patches before promotion.

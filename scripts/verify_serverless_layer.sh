@@ -16,12 +16,14 @@ mapping_version() {
 
 case "$#" in
     0)
-        upstream_version=$(tr -d '[:space:]' < "$upstream_path")
-        layer_version=$(mapping_version TeroExtensionLayerVersion)
+        merged_upstream=$(tr -d '[:space:]' < "$upstream_path")
+        expected_upstream=""
+        expected_layer=""
         ;;
     2)
-        upstream_version=$1
-        layer_version=$2
+        merged_upstream=$(tr -d '[:space:]' < "$upstream_path")
+        expected_upstream=$1
+        expected_layer=$2
         ;;
     *)
         echo "Usage: $0 [UPSTREAM_VERSION LAYER_VERSION]" >&2
@@ -29,22 +31,34 @@ case "$#" in
         ;;
 esac
 
-if [[ ! "$upstream_version" =~ ^[0-9]+$ ]] || [[ ! "$layer_version" =~ ^[1-9][0-9]*$ ]]; then
-    echo "Upstream and layer versions must be positive integers." >&2
-    exit 2
-fi
-
 template_upstream=$(mapping_version TeroExtensionLayerUpstream)
 template_layer=$(mapping_version TeroExtensionLayerVersion)
 
-if [ "$template_upstream" != "$upstream_version" ]; then
-    echo "serverless.yaml targets upstream v${template_upstream:-<missing>}, expected v${upstream_version}." >&2
+if [[ ! "$merged_upstream" =~ ^[0-9]+$ ]] \
+    || [[ ! "$template_upstream" =~ ^[0-9]+$ ]] \
+    || [[ ! "$template_layer" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Merged, template upstream, and layer versions must be positive integers." >&2
+    exit 2
+fi
+
+if [ "$template_upstream" -gt "$merged_upstream" ]; then
+    echo "serverless.yaml targets upstream v$template_upstream, but main contains only v$merged_upstream." >&2
     exit 1
 fi
 
-if [ "$template_layer" != "$layer_version" ]; then
-    echo "serverless.yaml targets layer version ${template_layer:-<missing>}, expected ${layer_version}." >&2
-    exit 1
+if [ -n "$expected_upstream" ]; then
+    if [[ ! "$expected_upstream" =~ ^[0-9]+$ ]] || [[ ! "$expected_layer" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Expected upstream and layer versions must be positive integers." >&2
+        exit 2
+    fi
+    if [ "$template_upstream" != "$expected_upstream" ]; then
+        echo "serverless.yaml targets upstream v$template_upstream, expected v$expected_upstream." >&2
+        exit 1
+    fi
+    if [ "$template_layer" != "$expected_layer" ]; then
+        echo "serverless.yaml targets layer version $template_layer, expected $expected_layer." >&2
+        exit 1
+    fi
 fi
 
 prod_reference="layer:Tero-Datadog-Extension-\${UpstreamVersion}-ARM:\${LayerVersion}"
@@ -60,4 +74,4 @@ if ! grep -Fq "$dev_reference" "$template_path"; then
     exit 1
 fi
 
-echo "serverless.yaml targets Tero Datadog extension v${upstream_version}, layer version ${layer_version}."
+echo "serverless.yaml targets Tero Datadog extension v${template_upstream}, layer version ${template_layer}; main contains v${merged_upstream}."

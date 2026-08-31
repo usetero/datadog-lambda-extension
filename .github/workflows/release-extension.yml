@@ -24,7 +24,7 @@ on:
         required: true
         type: string
       regions:
-        description: "Comma-separated AWS regions. Leave empty to publish to every region in DEFAULT_REGIONS."
+        description: "Comma-separated AWS regions. Leave empty to use .lambda-layer-regions."
         required: false
         default: ""
         type: string
@@ -54,12 +54,6 @@ permissions:
   id-token: write
   contents: read
 
-env:
-  # Every US and EU region that is enabled by default. Opt-in regions are left
-  # out on purpose: publishing to one that the account has not enabled fails the
-  # job. Add eu-south-1, eu-south-2 or eu-central-2 here once they are enabled.
-  DEFAULT_REGIONS: "us-east-1,us-east-2,us-west-1,us-west-2,eu-west-1,eu-west-2,eu-west-3,eu-central-1,eu-north-1"
-
 jobs:
   prepare:
     name: Prepare release
@@ -67,6 +61,7 @@ jobs:
     outputs:
       upstream_version: ${{ steps.version.outputs.upstream_version }}
       patch: ${{ steps.version.outputs.patch }}
+      regions: ${{ steps.vars.outputs.regions }}
       regions_json: ${{ steps.vars.outputs.regions_json }}
       build_matrix: ${{ steps.matrix.outputs.build_matrix }}
       publish_matrix: ${{ steps.matrix.outputs.publish_matrix }}
@@ -103,28 +98,20 @@ jobs:
       - name: Set variables
         id: vars
         run: |
-          # Convert regions to JSON array (compact, single line)
-          REGIONS="${{ inputs.regions || env.DEFAULT_REGIONS }}"
+          REGIONS="${{ inputs.regions }}"
+          if [ -z "$REGIONS" ]; then
+            REGIONS=$(paste -sd, .lambda-layer-regions)
+          fi
           REGIONS_JSON=$(echo "$REGIONS" | jq -c -R 'split(",") | map(gsub("^\\s+|\\s+$";""))')
+          echo "regions=$REGIONS" >> $GITHUB_OUTPUT
           echo "regions_json=$REGIONS_JSON" >> $GITHUB_OUTPUT
           echo "Regions: $REGIONS_JSON"
-
-      # Production releases are also a consumer-template contract. The layer
-      # name and patch embedded in serverless.yaml must describe what this run
-      # will publish, otherwise customers receive an ARN that cannot resolve.
-      - name: Verify consumer template layer
-        if: ${{ github.event_name == 'push' || inputs.dev != true }}
-        run: |
-          PATCH="${{ steps.version.outputs.patch }}"
-          ./scripts/verify_serverless_layer.sh \
-            "${{ steps.version.outputs.upstream_version }}" \
-            "${PATCH:-1}"
 
       - name: Build matrices
         id: matrix
         run: |
           ARCHS="${{ inputs.architectures || 'amd64,arm64' }}"
-          REGIONS="${{ inputs.regions || env.DEFAULT_REGIONS }}"
+          REGIONS="${{ steps.vars.outputs.regions }}"
 
           # Build matrix for build job with platform-specific runners
           BUILD_MATRIX='{"include":['
@@ -281,38 +268,51 @@ jobs:
           name: datadog_extension-${{ matrix.arch }}
           path: .layers
 
-      # A layer version can only be appended, never chosen, so the target patch
-      # is checked BEFORE publishing. A bare v<N> release must be patch 1; later
-      # patches use an explicit v<N>.<PATCH> tag. This keeps every region and the
-      # consumer template on the same immutable layer version.
-      - name: Check target patch version is next
+      # A retry verifies and reuses an existing target. Publishing only occurs
+      # where the target is genuinely next, so a partial matrix can converge.
+      - name: Plan layer publication
         id: version
         run: |
           set -euo pipefail
           LAYER_NAME="${{ steps.vars.outputs.layer_name }}"
+          LAYER_FILE=".layers/datadog_extension-${{ matrix.arch }}.zip"
           PATCH="${{ needs.prepare.outputs.patch }}"
-
-          LATEST=$(aws lambda list-layer-versions \
-            --layer-name "$LAYER_NAME" \
-            --query 'LayerVersions[0].Version' \
-            --output text 2>/dev/null | head -1 || echo "0")
-          if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
-            LATEST=0
-          fi
-          NEXT=$((LATEST + 1))
           TARGET=${PATCH:-1}
+          CODE_SHA256=$(openssl dgst -sha256 -binary "$LAYER_FILE" | openssl base64 -A)
 
-          if [ "$TARGET" != "$NEXT" ]; then
-            echo "::error::$LAYER_NAME in ${{ matrix.region }} would publish patch $NEXT, but $TARGET is required."
-            echo "::error::Latest published patch is $LATEST. Use an explicit v${{ needs.prepare.outputs.upstream_version }}.$NEXT patch release and update serverless.yaml first."
+          if EXISTING=$(aws lambda get-layer-version \
+              --layer-name "$LAYER_NAME" \
+              --version-number "$TARGET" \
+              --output json 2>&1); then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Version $TARGET already exists; it will be verified and reused."
+          elif grep -q 'ResourceNotFoundException' <<< "$EXISTING"; then
+            LATEST=$(aws lambda list-layer-versions \
+              --layer-name "$LAYER_NAME" \
+              --query 'LayerVersions[0].Version' \
+              --output text)
+            if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
+              LATEST=0
+            fi
+            NEXT=$((LATEST + 1))
+
+            if [ "$TARGET" != "$NEXT" ]; then
+              echo "::error::$LAYER_NAME in ${{ matrix.region }} would publish patch $NEXT, but $TARGET is required."
+              exit 1
+            fi
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Publishing $LAYER_NAME patch $TARGET to ${{ matrix.region }}"
+          else
+            echo "$EXISTING" >&2
             exit 1
           fi
 
-          echo "version=$NEXT" >> "$GITHUB_OUTPUT"
-          echo "Publishing $LAYER_NAME patch $NEXT to ${{ matrix.region }}"
+          echo "version=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "code_sha256=$CODE_SHA256" >> "$GITHUB_OUTPUT"
 
       - name: Publish Lambda layer
         id: publish
+        if: steps.version.outputs.exists != 'true'
         run: |
           set -euo pipefail
           aws sts get-caller-identity
@@ -320,6 +320,8 @@ jobs:
           LAYER_FILE=".layers/datadog_extension-${{ matrix.arch }}.zip"
           COMPATIBLE_ARCH="${{ steps.vars.outputs.compatible_arch }}"
           UPSTREAM="${{ needs.prepare.outputs.upstream_version }}"
+          EXPECTED_VERSION="${{ steps.version.outputs.version }}"
+          EXPECTED_CODE_SHA256="${{ steps.version.outputs.code_sha256 }}"
 
           PUBLISH_RESULT=$(aws lambda publish-layer-version \
             --layer-name "$LAYER_NAME" \
@@ -332,10 +334,13 @@ jobs:
 
           if ! jq -e \
               --arg architecture "$COMPATIBLE_ARCH" \
-              --argjson version "$PUBLISHED_VERSION" \
-              '.Version == $version and (.CompatibleArchitectures | index($architecture) != null)' \
+              --arg code_sha256 "$EXPECTED_CODE_SHA256" \
+              --argjson version "$EXPECTED_VERSION" \
+              '.Version == $version
+                and .Content.CodeSha256 == $code_sha256
+                and (.CompatibleArchitectures | index($architecture) != null)' \
               <<< "$PUBLISH_RESULT" >/dev/null; then
-            echo "::error::AWS publish response did not match the requested version and architecture."
+            echo "::error::AWS publish response did not match the requested version, artifact, and architecture."
             exit 1
           fi
           echo "Published version $PUBLISHED_VERSION"
@@ -360,47 +365,120 @@ jobs:
           fi
           echo "Made version $PUBLISHED_VERSION public"
 
-          LIST_RESULT=$(aws lambda list-layer-versions \
+      - name: Verify published layer
+        id: verify
+        run: |
+          set -euo pipefail
+          LAYER_NAME="${{ steps.vars.outputs.layer_name }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          ./scripts/verify_published_layer.sh \
+            "${{ matrix.region }}" \
+            "$LAYER_NAME" \
+            "$VERSION" \
+            "${{ steps.vars.outputs.compatible_arch }}" \
+            "${{ steps.version.outputs.code_sha256 }}"
+
+          LAYER_ARN=$(aws lambda get-layer-version \
             --layer-name "$LAYER_NAME" \
-            --output json)
-          if ! jq -e \
-              --arg arn "$LAYER_VERSION_ARN" \
-              --arg architecture "$COMPATIBLE_ARCH" \
-              --argjson version "$PUBLISHED_VERSION" \
-              'any(.LayerVersions[];
-                .LayerVersionArn == $arn
-                and .Version == $version
-                and (.CompatibleArchitectures | index($architecture) != null))' \
-              <<< "$LIST_RESULT" >/dev/null; then
-            echo "::error::Published layer version was not returned by ListLayerVersions."
-            exit 1
-          fi
-          echo "Verified published version and architecture"
-
-          echo "published_version=$PUBLISHED_VERSION" >> "$GITHUB_OUTPUT"
-
-          # Output the layer ARN for reference
-          echo "Layer ARN: $LAYER_VERSION_ARN"
-          echo "layer_arn=$LAYER_VERSION_ARN" >> "$GITHUB_OUTPUT"
+            --version-number "$VERSION" \
+            --query LayerVersionArn \
+            --output text)
+          echo "published_version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "layer_arn=$LAYER_ARN" >> "$GITHUB_OUTPUT"
 
       - name: Summary
         run: |
           echo "### Published Layer" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Layer Name:** ${{ steps.vars.outputs.layer_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version:** ${{ steps.publish.outputs.published_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ steps.verify.outputs.published_version }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Region:** ${{ matrix.region }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Architecture:** ${{ steps.vars.outputs.compatible_arch }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Layer ARN:**" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.publish.outputs.layer_arn }}" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.verify.outputs.layer_arn }}" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  promote-template:
+    name: Promote consumer template
+    runs-on: ubuntu-22.04
+    needs: [prepare, publish]
+    if: ${{ needs.publish.result == 'success' && inputs.dry_run != true && inputs.dev != true }}
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TAG_TOKEN }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Verify complete production release
+        run: |
+          PATCH="${{ needs.prepare.outputs.patch }}"
+          ./scripts/verify_release_matrix.sh \
+            "${{ needs.prepare.outputs.upstream_version }}" \
+            "${PATCH:-1}"
+
+      - name: Open template promotion pull request
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+          UPSTREAM_VERSION: ${{ needs.prepare.outputs.upstream_version }}
+          RELEASE_PATCH: ${{ needs.prepare.outputs.patch }}
+        run: |
+          set -euo pipefail
+          PATCH=${RELEASE_PATCH:-1}
+          BRANCH="chore/promote-layer-v${UPSTREAM_VERSION}.${PATCH}"
+
+          ./scripts/set_serverless_layer_version.sh "$UPSTREAM_VERSION" "$PATCH"
+          if git diff --quiet -- serverless.yaml; then
+            echo "Consumer template already targets v${UPSTREAM_VERSION}:${PATCH}."
+            exit 0
+          fi
+
+          if gh pr list --state open --head "$BRANCH" --json number --jq 'length' | grep -qx 1; then
+            echo "A template promotion PR for v${UPSTREAM_VERSION}:${PATCH} is already open."
+            exit 0
+          fi
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "::error::$BRANCH exists without an open pull request; inspect it before retrying."
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add serverless.yaml
+          git commit -m "chore: promote Lambda layer v${UPSTREAM_VERSION}.${PATCH}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "chore: promote Lambda layer v${UPSTREAM_VERSION}.${PATCH}" \
+            --body "$(printf '%s\n' \
+              "## Overview" \
+              "" \
+              "Promotes the consumer template after every production layer target" \
+              "was verified in every supported region and architecture." \
+              "" \
+              "## Testing" \
+              "" \
+              "- Full AWS production layer matrix verified" \
+              "- Layer version, architecture, artifact hash, and public policy verified during publishing")"
 
   release-summary:
     name: Release Summary
     runs-on: ubuntu-22.04
-    needs: [prepare, build, publish]
+    needs: [prepare, build, publish, promote-template]
     if: always()
     steps:
       - name: Download all artifacts
