@@ -11,9 +11,26 @@ upstream_version=$1
 layer_version=$2
 template_path=${TEMPLATE_PATH:-serverless.yaml}
 
+mapping_version() {
+    local mapping=$1
+    awk -v mapping="$mapping" '
+        $1 == mapping ":" { in_mapping = 1; next }
+        in_mapping && $1 == "Version:" { print $2; exit }
+        in_mapping && $0 ~ /^[^[:space:]]/ { exit }
+    ' "$template_path"
+}
+
 if [[ ! "$upstream_version" =~ ^[0-9]+$ ]] || [[ ! "$layer_version" =~ ^[1-9][0-9]*$ ]]; then
     echo "Upstream and layer versions must be positive integers." >&2
     exit 2
+fi
+
+current_upstream=$(mapping_version TeroExtensionLayerUpstream)
+current_layer=$(mapping_version TeroExtensionLayerVersion)
+if [ "$upstream_version" -lt "$current_upstream" ] \
+    || { [ "$upstream_version" -eq "$current_upstream" ] && [ "$layer_version" -lt "$current_layer" ]; }; then
+    echo "Refusing to move serverless.yaml backward from v${current_upstream}:${current_layer} to v${upstream_version}:${layer_version}." >&2
+    exit 1
 fi
 
 UPSTREAM_VERSION=$upstream_version LAYER_VERSION=$layer_version perl -0pi -e '
