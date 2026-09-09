@@ -3222,9 +3222,9 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "policy-rs"
-version = "1.8.1"
+version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31d01d800447cca9e73676635737a99ac17c1556b7eef05e9942658ac0aec8fe"
+checksum = "c8bf7df08be66430b6f6dabfc3d4e630f10285bd926773e7ecb56d22d9662fab"
 dependencies = [
  "fnv",
  "notify",

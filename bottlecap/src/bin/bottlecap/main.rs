@@ -376,6 +376,11 @@ async fn extension_loop_active(
             ],
         };
 
+        // Kept so the flush path can reach them. A provider's poll loop is a
+        // timer, and Lambda takes the CPU away between invocations, so the
+        // timer alone rarely delivers a sync.
+        let mut http_providers: Vec<Arc<HttpProvider>> = Vec::new();
+
         // Register all configured providers
         if let Some(providers) = &config.ext.policy_providers {
             for provider_config in providers {
@@ -400,6 +405,7 @@ async fn extension_loop_active(
                                 if let Err(e) = registry.subscribe(&provider) {
                                     error!("POLICY | Failed to subscribe provider {}: {}", id, e);
                                 } else {
+                                    http_providers.push(Arc::new(provider));
                                     info!(
                                         "POLICY | Successfully synced with Tero control plane (provider: {}, url: {})",
                                         id, url
@@ -430,7 +436,10 @@ async fn extension_loop_active(
             );
         }
 
-        Some(Arc::new(PolicyEvaluator::new(registry)))
+        Some(Arc::new(PolicyEvaluator::with_providers(
+            registry,
+            http_providers,
+        )))
     } else {
         None
     };
@@ -610,6 +619,7 @@ async fn extension_loop_active(
         let proxy_flusher_clone = proxy_flusher.clone();
         let metrics_aggr_handle_clone = metrics_aggregator_handle.clone();
         let dsm_processor_clone = dsm_processor.clone();
+        let policy_evaluator_clone = policy_evaluator.clone();
 
         // In Managed Instance mode, create a separate interval for the background flusher task.
         // We don't reuse race_flush_interval because we need to configure the missed tick
@@ -641,7 +651,8 @@ async fn extension_loop_active(
                 metrics_flushers_clone,
                 metrics_aggr_handle_clone,
                 dsm_processor_clone,
-            );
+            )
+            .with_policy_evaluator(policy_evaluator_clone);
 
             loop {
                 tokio::select! {
@@ -816,7 +827,8 @@ async fn extension_loop_active(
         Arc::clone(&metrics_flushers),
         metrics_aggregator_handle.clone(),
         dsm_processor.clone(),
-    );
+    )
+    .with_policy_evaluator(policy_evaluator.clone());
     handle_next_invocation(next_lambda_response, &invocation_processor_handle).await;
     loop {
         let maybe_shutdown_event;
