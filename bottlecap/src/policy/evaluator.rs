@@ -4,7 +4,7 @@
 //! and `PolicyRegistry` from `policy-rs`, providing a simple `should_keep` method
 //! for filtering telemetry.
 
-use policy_rs::{EvaluateResult, Matchable, PolicyEngine, PolicyRegistry};
+use policy_rs::{EvaluateResult, HttpProvider, Matchable, PolicyEngine, PolicyRegistry};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -16,15 +16,44 @@ use tracing::{debug, warn};
 pub struct PolicyEvaluator {
     engine: PolicyEngine,
     registry: Arc<PolicyRegistry>,
+    /// Providers that report observed volume and policy statuses upstream.
+    ///
+    /// Held so [`Self::flush`] can reach them. A provider's own poll loop is a
+    /// timer, and Lambda takes the CPU away between invocations, so the timer
+    /// alone rarely delivers a sync.
+    providers: Vec<Arc<HttpProvider>>,
 }
 
 impl PolicyEvaluator {
     /// Creates a new policy evaluator with the given registry.
     #[must_use]
     pub fn new(registry: Arc<PolicyRegistry>) -> Self {
+        Self::with_providers(registry, Vec::new())
+    }
+
+    /// Creates a policy evaluator that can flush the given providers.
+    #[must_use]
+    pub fn with_providers(
+        registry: Arc<PolicyRegistry>,
+        providers: Vec<Arc<HttpProvider>>,
+    ) -> Self {
         Self {
             engine: PolicyEngine::new(),
             registry,
+            providers,
+        }
+    }
+
+    /// Reports observed volume and policy statuses to every HTTP provider.
+    ///
+    /// Call this where the extension is sure to run, which means the end of an
+    /// invocation and shutdown. A failed flush keeps its volume for the next
+    /// one, so an error here loses no counts.
+    pub async fn flush(&self) {
+        for provider in &self.providers {
+            if let Err(e) = provider.flush().await {
+                debug!("POLICY | Flush to control plane failed: {e}");
+            }
         }
     }
 

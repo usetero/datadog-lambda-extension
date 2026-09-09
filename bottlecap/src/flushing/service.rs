@@ -10,6 +10,7 @@ use dogstatsd::{
 
 use crate::flushing::handles::{FlushHandles, MetricsRetryBatch};
 use crate::logs::flusher::LogsFlusher;
+use crate::policy::PolicyEvaluator;
 use crate::traces::{
     proxy_flusher::Flusher as ProxyFlusher, stats_flusher::StatsFlusher,
     trace_flusher::TraceFlusher,
@@ -33,6 +34,11 @@ pub struct FlushingService {
     /// pipeline-stats payload is drained into the proxy aggregator immediately
     /// before each proxy flush. `None` unless `DD_DATA_STREAMS_ENABLED` is set.
     dsm_processor: Option<Arc<crate::traces::data_streams::DsmProcessor>>,
+
+    /// Optional policy evaluator. When present, each flush also reports observed
+    /// volume and policy statuses to the control plane. `None` unless policy is
+    /// enabled.
+    policy_evaluator: Option<Arc<PolicyEvaluator>>,
 
     // Metrics aggregator handle for getting data to flush
     metrics_aggr_handle: MetricsAggregatorHandle,
@@ -60,9 +66,17 @@ impl FlushingService {
             proxy_flusher,
             metrics_flushers,
             dsm_processor,
+            policy_evaluator: None,
             metrics_aggr_handle,
             handles: FlushHandles::new(),
         }
+    }
+
+    /// Also report policy volume and statuses on every flush.
+    #[must_use]
+    pub fn with_policy_evaluator(mut self, evaluator: Option<Arc<PolicyEvaluator>>) -> Self {
+        self.policy_evaluator = evaluator;
+        self
     }
 
     /// Returns `true` if any flush operation is still pending.
@@ -142,6 +156,14 @@ impl FlushingService {
             .push(tokio::spawn(async move {
                 pf.flush(None).await.unwrap_or_default()
             }));
+
+        // Report policy volume. Spawned, so it adds no latency to an
+        // invocation. A freeze can cancel this task before the request lands,
+        // but a cancelled sync returns its volume to the tracker, so nothing is
+        // lost — the next flush, or the final one at shutdown, carries it.
+        if let Some(evaluator) = self.policy_evaluator.clone() {
+            tokio::spawn(async move { evaluator.flush().await });
+        }
     }
 
     /// Awaits all pending flush handles and performs retry for failed flushes.
@@ -341,12 +363,22 @@ impl FlushingService {
             dsm.drain_into_proxy().await;
         }
 
+        // Reported inline, not spawned: a spawned sync can be frozen and
+        // cancelled between invocations, and this is the point where the
+        // extension is sure to have CPU.
+        let policy_flush = async {
+            if let Some(evaluator) = &self.policy_evaluator {
+                evaluator.flush().await;
+            }
+        };
+
         tokio::join!(
             self.logs_flusher.flush(None),
             futures::future::join_all(metrics_futures),
             self.trace_flusher.flush(None),
             self.stats_flusher.flush(force_stats, None),
             self.proxy_flusher.flush(None),
+            policy_flush,
         );
     }
 }
