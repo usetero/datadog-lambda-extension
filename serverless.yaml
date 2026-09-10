@@ -39,7 +39,7 @@ Mappings:
     TeroExtensionLayerUpstream:
       Version: 99
     TeroExtensionLayerVersion:
-      Version: 1
+      Version: 2
 
 Metadata:
   AWS::CloudFormation::Interface:
